@@ -27,13 +27,14 @@ TEMP_ENCODE_DIR = "temp_encode_processing"
 TEMP_DECODE_DIR = "temp_decode_processing"
 ASSEMBLED_FILES_DIR = "assembled_files"
 BARCODE_NUM_BITS = 32
+PIXEL_CHANNELS = 3
 
 # --- PyTorch Constants ---
 INFO_HAMMING_K = 4
 INFO_HAMMING_N = 7
 INFO_K_SIDE = 16
 INFO_BITS_PER_PALETTE_COLOR = 1
-INFO_COLOR_PALETTE_TENSOR = torch.tensor([[0, 0, 0, 255], [255, 255, 255, 255]], dtype=torch.uint8)
+INFO_COLOR_PALETTE_TENSOR = torch.tensor([[0, 0, 0], [255, 255, 255]], dtype=torch.uint8)
 INFO_G_MATRIX_TENSOR = torch.tensor([
     [1,0,0,0,1,1,1], [0,1,0,0,1,1,0], [0,0,1,0,1,0,1], [0,0,0,1,0,1,1]
 ], dtype=torch.uint8)
@@ -140,9 +141,11 @@ def tensor_to_frame(bits_tensor: torch.Tensor, k_side: int, palette: torch.Tenso
     bits_for_frame = bits_tensor[:required_bits]
     bit_groups = bits_for_frame.view(num_pixels, bits_per_color)
     powers_of_2 = 2 ** torch.arange(bits_per_color - 1, -1, -1, device=device, dtype=torch.long)
+    palette = palette.to(device)
     palette_indices = torch.matmul(bit_groups.float(), powers_of_2.float()).long()
-    pixel_data = torch.nn.functional.embedding(palette_indices, palette.to(device))
-    frame_tensor = pixel_data.view(k_side, k_side, 4)
+    pixel_data = torch.nn.functional.embedding(palette_indices, palette)
+    num_channels = palette.shape[1]
+    frame_tensor = pixel_data.view(k_side, k_side, num_channels)
     return frame_tensor.to(torch.uint8)
 
 def generate_palette_tensor(num_colors: int, device: torch.device) -> torch.Tensor:
@@ -157,17 +160,17 @@ def generate_palette_tensor(num_colors: int, device: torch.device) -> torch.Tens
     if num_colors not in palettes:
         logging.warning(f"No predefined palette for {num_colors} colors. Generating a grayscale ramp.")
         palette_rgb = [[int(255 * i / (num_colors - 1))] * 3 for i in range(num_colors)]
-    else: palette_rgb = palettes[num_colors]
-    palette_rgba = [color + [255] for color in palette_rgb]
-    return torch.tensor(palette_rgba, dtype=torch.uint8, device=device)
+    else:
+        palette_rgb = palettes[num_colors]
+    return torch.tensor(palette_rgb, dtype=torch.uint8, device=device)
 
 def frame_to_bits_batch(frame_batch: torch.Tensor, palette: torch.Tensor, bits_per_color: int) -> torch.Tensor:
     device = frame_batch.device
-    num_frames, h, w, _ = frame_batch.shape
-    
-    pixels = frame_batch.view(num_frames * h * w, 4).float()
+    num_frames, h, w, c = frame_batch.shape
+
+    pixels = frame_batch.view(num_frames * h * w, c).float()
     palette = palette.to(device).float()
-    distances = torch.cdist(pixels[:, :3], palette[:, :3])
+    distances = torch.cdist(pixels, palette)
     indices = torch.argmin(distances, dim=1)
     
     unpacked_bits = []
@@ -266,8 +269,7 @@ def generate_barcode_frame(num_info_frames: int, config: Dict, device: torch.dev
     combined_value = (encoder_fps << 16) | num_info_frames
     bit_string = f'{combined_value:0{BARCODE_NUM_BITS}b}'
     colors = torch.tensor([255 if bit == '1' else 0 for bit in bit_string], dtype=torch.uint8, device=device)
-    frame_tensor = torch.zeros((video_height, video_width, 4), dtype=torch.uint8, device=device)
-    frame_tensor[:, :, 3] = 255
+    frame_tensor = torch.zeros((video_height, video_width, PIXEL_CHANNELS), dtype=torch.uint8, device=device)
     bar_width = video_width / float(BARCODE_NUM_BITS)
     for i in range(BARCODE_NUM_BITS):
         x_start, x_end = int(i * bar_width), int((i + 1) * bar_width)
@@ -483,7 +485,7 @@ class FFmpegConsumerThread(threading.Thread):
         fps = self.config["VIDEO_FPS"]
         self.ffmpeg_command_base = [
             self.config["FFMPEG_PATH"], '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
-            '-s', f'{width}x{height}', '-pix_fmt', 'rgba', '-r', str(fps), '-i', '-',
+            '-s', f'{width}x{height}', '-pix_fmt', 'rgb24', '-r', str(fps), '-i', '-',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage',
             '-keyint_min', '1',
             '-sc_threshold', '0',
@@ -563,7 +565,7 @@ class FFmpegConsumerThread(threading.Thread):
                          ).permute(0, 2, 3, 1).byte()
                     else:
                         sub_batch_resized = sub_batch
-                    np_batch = sub_batch_resized.cpu().numpy()
+                    np_batch = sub_batch_resized.contiguous().cpu().numpy()
                     for frame_np in np_batch:
                         if self.stop_event.is_set():
                             break
@@ -746,17 +748,10 @@ def extract_frame_as_tensor(video_path: Path, frame_index: int, temp_dir: Path, 
             return None
         img_bytes = proc.stdout
         with Image.open(io.BytesIO(img_bytes)) as img:
-            img_rgba = img.convert('RGBA')
-            np_frame = np.array(img_rgba)
-            # Verify we got the right size and channels
-            if np_frame.shape != (extract_size, extract_size, 4):
-                # Fix channel count if needed
-                if np_frame.shape[2] == 3:
-                    alpha = np.ones((np_frame.shape[0], np_frame.shape[1], 1), dtype=np.uint8) * 255
-                    np_frame = np.concatenate([np_frame, alpha], axis=2)
-                # Fix size if needed
-                if np_frame.shape[:2] != (extract_size, extract_size):
-                    np_frame = np.array(Image.fromarray(np_frame).resize((extract_size, extract_size), Image.Resampling.NEAREST))
+            img_rgb = img.convert('RGB')
+            np_frame = np.array(img_rgb)
+            if np_frame.shape[:2] != (extract_size, extract_size):
+                np_frame = np.array(Image.fromarray(np_frame).resize((extract_size, extract_size), Image.Resampling.NEAREST))
         return torch.from_numpy(np_frame)
     except subprocess.CalledProcessError as e:
         logging.error(f"Failed to extract frame {frame_index}. FFmpeg stderr:\n{e.stderr.decode('utf-8', 'ignore') if e.stderr else 'no stderr'}")
@@ -795,7 +790,7 @@ def extract_frames_batch(video_path: Path, start_frame_index: int, frame_count: 
         '-i', str(video_path),
         '-vframes', str(frame_count),
         '-vf', scale_filter,
-        '-pix_fmt', 'rgba',
+        '-pix_fmt', 'rgb24',
         '-vsync', '0',
         '-f', 'rawvideo',
         '-'
@@ -821,7 +816,7 @@ def extract_frames_batch(video_path: Path, start_frame_index: int, frame_count: 
         logging.error("FFmpeg returned no pixel data for frames %d-%d (%s)", start_frame_index, start_frame_index + frame_count - 1, frame_type)
         return None
 
-    bytes_per_frame = extract_size * extract_size * 4
+    bytes_per_frame = extract_size * extract_size * 3
     total_bytes = len(raw)
     actual_frames = total_bytes // bytes_per_frame
     if actual_frames == 0:
@@ -838,7 +833,7 @@ def extract_frames_batch(video_path: Path, start_frame_index: int, frame_count: 
 
     usable_bytes = actual_frames * bytes_per_frame
     np_buffer = np.frombuffer(raw[:usable_bytes], dtype=np.uint8).copy()
-    frame_tensor = torch.from_numpy(np_buffer).view(actual_frames, extract_size, extract_size, 4).to(torch.uint8)
+    frame_tensor = torch.from_numpy(np_buffer).view(actual_frames, extract_size, extract_size, 3).to(torch.uint8)
     return frame_tensor
 
 
@@ -879,7 +874,7 @@ class SegmentedDataFrameReader:
 
     def fetch_frames(self, desired_count: int) -> Optional[torch.Tensor]:
         if desired_count <= 0:
-            return torch.empty((0, self.config['DATA_K_SIDE'], self.config['DATA_K_SIDE'], 4), dtype=torch.uint8)
+            return torch.empty((0, self.config['DATA_K_SIDE'], self.config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
 
         collected = []
         remaining = desired_count
@@ -954,7 +949,7 @@ def bits_to_bytes(bits: torch.Tensor) -> bytes:
 def decode_info_frames(frames, device: torch.device, syndrome_table: Optional[torch.Tensor] = None) -> Optional[Dict]:
     """Decode info frames (Hamming(7,4) encoded JSON) back into a Python dict.
 
-    Accepts either a torch.Tensor of shape (num_frames, H, W, 4) or a list of such tensors.
+    Accepts either a torch.Tensor of shape (num_frames, H, W, 3) or a list of such tensors.
     Automatically downscales frames to INFO_K_SIDE x INFO_K_SIDE before bit extraction.
     If a syndrome_table is provided it will be used; otherwise it is constructed from the
     built-in INFO_H_MATRIX_TENSOR.
@@ -1217,11 +1212,11 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
 
                 if batch_tensor_cpu is None or batch_tensor_cpu.shape[0] == 0:
                     logging.warning("No more frames available across provided segments. Padding remaining frames with zeros.")
-                    batch_tensor_cpu = torch.zeros((batch_count, config['DATA_K_SIDE'], config['DATA_K_SIDE'], 4), dtype=torch.uint8)
+                    batch_tensor_cpu = torch.zeros((batch_count, config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
                 elif batch_tensor_cpu.shape[0] < batch_count:
                     deficit = batch_count - batch_tensor_cpu.shape[0]
                     logging.warning(f"Recovered {batch_tensor_cpu.shape[0]} frame(s); padding remaining {deficit} with zeros.")
-                    padding = torch.zeros((deficit, config['DATA_K_SIDE'], config['DATA_K_SIDE'], 4), dtype=torch.uint8)
+                    padding = torch.zeros((deficit, config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
                     batch_tensor_cpu = torch.cat((batch_tensor_cpu, padding), dim=0)
             else:
                 batch_tensor_cpu = extract_frames_batch(
@@ -1239,7 +1234,7 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
                         frame = extract_frame_as_tensor(primary_video, actual_frame_index, temp_dir, config, frame_type='data')
                         if frame is None:
                             logging.warning(f"Could not extract data frame at index {actual_frame_index}. Filling with zeros.")
-                            frame = torch.zeros((config['DATA_K_SIDE'], config['DATA_K_SIDE'], 4), dtype=torch.uint8)
+                            frame = torch.zeros((config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
                         frame_batch.append(frame)
                     if not frame_batch:
                         break
@@ -1249,7 +1244,7 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
                     if actual < batch_count:
                         deficit = batch_count - actual
                         logging.warning(f"Padding {deficit} missing frame(s) after batched extraction.")
-                        padding = torch.zeros((deficit, config['DATA_K_SIDE'], config['DATA_K_SIDE'], 4), dtype=torch.uint8)
+                        padding = torch.zeros((deficit, config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
                         batch_tensor_cpu = torch.cat((batch_tensor_cpu, padding), dim=0)
 
             batch_tensor = batch_tensor_cpu.to(device)
@@ -1501,7 +1496,7 @@ def run_test_suite():
         frame_32x32 = tensor_to_frame(encoded_bits, test_k_side, palette_4color, test_bits_per_color)
         
         # DEBUG: Check frame colors
-        unique_colors = torch.unique(frame_32x32.view(-1, 4), dim=0)
+        unique_colors = torch.unique(frame_32x32.view(-1, frame_32x32.shape[-1]), dim=0)
         logging.info(f"   Frame colors ({len(unique_colors)} unique): {unique_colors.cpu().numpy().tolist()}")
         
         # Extract bits directly from 32x32 frame (NO upscaling - that's a video codec concern, not Hamming concern)
