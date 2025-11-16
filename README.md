@@ -34,7 +34,7 @@ Each script lists missing dependencies and suggests installation steps (includin
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/<you>/PythonFileToYoutube.git
+   git clone https://github.com/Keksmania/PythonFileToYoutube.git
    cd PythonFileToYoutube
    ```
 2. **Install Python dependencies** – the project relies solely on the standard library and PyTorch (installed globally via the PyTorch instructions).
