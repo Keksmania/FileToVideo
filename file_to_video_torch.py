@@ -17,6 +17,8 @@ import io
 from PIL import Image
 import filecmp
 import tempfile
+import shutil
+import time
 
 import numpy as np
 import torch
@@ -28,6 +30,12 @@ TEMP_DECODE_DIR = "temp_decode_processing"
 ASSEMBLED_FILES_DIR = "assembled_files"
 BARCODE_NUM_BITS = 32
 PIXEL_CHANNELS = 3
+
+# Config metadata embedded into info frames so decoders can reproduce settings
+DECODE_CONFIG_EXPORT_KEYS = [
+    "DATA_K_SIDE",
+    "NUM_COLORS_DATA"
+]
 
 # --- PyTorch Constants ---
 INFO_HAMMING_K = 4
@@ -101,6 +109,49 @@ def load_config() -> Dict[str, Any]:
     except (IOError, json.JSONDecodeError) as e:
         logging.error(f"Failed to load or parse config file: {e}")
         logging.warning("Using internal default configuration."); return default_config
+
+
+def capture_decode_config_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect critical encode settings required for decoding on another machine."""
+    snapshot = {}
+    for key in DECODE_CONFIG_EXPORT_KEYS:
+        if key in config and config[key] is not None:
+            snapshot[key] = config[key]
+    # Include informational constants for completeness/debugging
+    snapshot["INFO_K_SIDE"] = INFO_K_SIDE
+    snapshot["INFO_BITS_PER_PALETTE_COLOR"] = INFO_BITS_PER_PALETTE_COLOR
+    snapshot["DATA_HAMMING_K"] = DATA_HAMMING_K
+    snapshot["DATA_HAMMING_N"] = DATA_HAMMING_N
+    return snapshot
+
+
+def apply_snapshot_to_config(config: Dict[str, Any], snapshot: Optional[Dict[str, Any]]) -> None:
+    """Override local config with manifest-provided settings when available."""
+    if not snapshot:
+        logging.warning("Manifest missing encode_config_snapshot; using local configuration values.")
+        return
+    applied_keys = []
+    missing_keys = []
+    for key in DECODE_CONFIG_EXPORT_KEYS:
+        if key in snapshot:
+            config[key] = snapshot[key]
+            applied_keys.append(key)
+        else:
+            missing_keys.append(key)
+    if applied_keys:
+        logging.info(f"Applied decode settings from manifest: {', '.join(applied_keys)}")
+    if missing_keys:
+        logging.warning(f"Manifest snapshot missing these decode keys: {', '.join(missing_keys)}")
+
+
+def cleanup_temp_dir(temp_path: Path, label: str) -> None:
+    """Best-effort removal of a temporary working directory."""
+    if temp_path.exists():
+        try:
+            shutil.rmtree(temp_path)
+            logging.info(f"Cleaned up {label} directory: {temp_path}")
+        except Exception as e:
+            logging.warning(f"Failed to remove {label} directory '{temp_path}': {e}")
 
 # --- Core Utility Functions ---
 
@@ -281,6 +332,7 @@ def generate_info_artifacts(file_manifest: Dict, config: Dict, device: torch.dev
     logging.info("Step 3: Generating info frame artifacts...")
     info_json_obj = file_manifest.copy()
     info_json_obj.update({"version": "Python_FileToYoutube_v1.0.1", "is_password_protected": config.get("is_password_protected", False), "info_frame_count": 0, "data_frame_count": 0})
+    info_json_obj["encode_config_snapshot"] = capture_decode_config_snapshot(config)
 
     bits_per_frame = INFO_K_SIDE * INFO_K_SIDE * INFO_BITS_PER_PALETTE_COLOR
 
@@ -589,106 +641,120 @@ class FFmpegConsumerThread(threading.Thread):
         self._finalize_current_segment()
 
 def encode_orchestrator(input_path: Path, output_dir: Path, password: Optional[str], config: Dict, device: torch.device):
+    encode_start = time.perf_counter()
     logging.info(f"Starting encoding for '{input_path}'...")
     temp_dir = output_dir / TEMP_ENCODE_DIR; temp_dir.mkdir(exist_ok=True)
+    produced_files: List[Path] = []
+    files_to_encode: List[Path] = []
     try:
-        derived_params = get_derived_encoding_params(config, device)
-    except ValueError as e: logging.error(f"Configuration Error: {e}"); return
-    prep_result = prepare_files_for_encoding(input_path, temp_dir, config, password)
-    if prep_result is None: return
-    files_to_encode, file_manifest = prep_result
-    config["is_password_protected"] = bool(password)
-    info_frames_batch = generate_info_artifacts(file_manifest, config, device, derived_params)
-    if info_frames_batch is None: return
-    barcode_frame_batch = generate_barcode_frame(info_frames_batch.shape[0], config, device)
-    if barcode_frame_batch is None: return
-    output_base_path = output_dir / f"{input_path.stem}_F2YT"
-    data_queue, frame_queue = queue.Queue(maxsize=4), queue.Queue(maxsize=4)
-    producer = DataProducerThread(files_to_encode, data_queue, derived_params)
-    consumer = FFmpegConsumerThread(frame_queue, output_base_path, config)
-    producer.start(); consumer.start()
-    try:
-        logging.info("--- Starting main processing pipeline ---")
-        frame_queue.put(barcode_frame_batch)
-        frame_queue.put(info_frames_batch)
-        while True:
-            bits_tensor_cpu = data_queue.get()
-            if bits_tensor_cpu is None: break
-            bits_tensor_gpu = bits_tensor_cpu.to(device)
-            pixel_tensor_gpu = encode_data_frames_gpu(bits_tensor_gpu, derived_params)
-            if pixel_tensor_gpu.numel() == 0:
-                continue
-            # Diagnostic: log how many frames and basic stats
-            try:
-                num_frames_out = pixel_tensor_gpu.shape[0]
-                logging.info(f"Encoder produced pixel tensor: frames={num_frames_out}, shape={tuple(pixel_tensor_gpu.shape)}")
-            except Exception:
-                logging.debug("Encoder produced pixel tensor (unable to inspect shape).")
-            frame_queue.put(pixel_tensor_gpu)
-    except KeyboardInterrupt:
-        logging.warning("Keyboard interrupt detected. Shutting down pipeline.")
-        producer.stop(); consumer.stop()
-    except Exception as e:
-        logging.error(f"Error in main processing loop: {e}", exc_info=True)
-        producer.stop(); consumer.stop()
+        try:
+            derived_params = get_derived_encoding_params(config, device)
+        except ValueError as e:
+            logging.error(f"Configuration Error: {e}")
+            return
+        prep_result = prepare_files_for_encoding(input_path, temp_dir, config, password)
+        if prep_result is None:
+            return
+        files_to_encode, file_manifest = prep_result
+        config["is_password_protected"] = bool(password)
+        info_frames_batch = generate_info_artifacts(file_manifest, config, device, derived_params)
+        if info_frames_batch is None:
+            return
+        barcode_frame_batch = generate_barcode_frame(info_frames_batch.shape[0], config, device)
+        if barcode_frame_batch is None:
+            return
+        output_base_path = output_dir / f"{input_path.stem}_F2YT"
+        data_queue, frame_queue = queue.Queue(maxsize=4), queue.Queue(maxsize=4)
+        producer = DataProducerThread(files_to_encode, data_queue, derived_params)
+        consumer = FFmpegConsumerThread(frame_queue, output_base_path, config)
+        producer.start(); consumer.start()
+        try:
+            logging.info("--- Starting main processing pipeline ---")
+            frame_queue.put(barcode_frame_batch)
+            frame_queue.put(info_frames_batch)
+            while True:
+                bits_tensor_cpu = data_queue.get()
+                if bits_tensor_cpu is None:
+                    break
+                bits_tensor_gpu = bits_tensor_cpu.to(device)
+                pixel_tensor_gpu = encode_data_frames_gpu(bits_tensor_gpu, derived_params)
+                if pixel_tensor_gpu.numel() == 0:
+                    continue
+                # Diagnostic: log how many frames and basic stats
+                try:
+                    num_frames_out = pixel_tensor_gpu.shape[0]
+                    logging.info(f"Encoder produced pixel tensor: frames={num_frames_out}, shape={tuple(pixel_tensor_gpu.shape)}")
+                except Exception:
+                    logging.debug("Encoder produced pixel tensor (unable to inspect shape).")
+                frame_queue.put(pixel_tensor_gpu)
+        except KeyboardInterrupt:
+            logging.warning("Keyboard interrupt detected. Shutting down pipeline.")
+            producer.stop(); consumer.stop()
+        except Exception as e:
+            logging.error(f"Error in main processing loop: {e}", exc_info=True)
+            producer.stop(); consumer.stop()
+        finally:
+            frame_queue.put(None)
+            logging.info("Waiting for producer thread to finish...")
+            producer.join()
+            logging.info("Producer thread finished. Waiting for FFmpeg consumer to flush to disk...")
+            consumer.join()
+            logging.info("FFmpeg consumer confirmed all segments written.")
+            if consumer.output_paths:
+                produced_files = consumer.output_paths.copy()
+            else:
+                default_name = output_base_path if output_base_path.suffix else output_base_path.parent / f"{output_base_path.name}.mp4"
+                produced_files = [default_name]
+
+            segmentation_enabled = config.get("MAX_VIDEO_SEGMENT_HOURS", 11)
+            if segmentation_enabled and len(produced_files) == 1 and produced_files[0].name.endswith("_part001.mp4"):
+                legacy_name = output_base_path if output_base_path.suffix else output_base_path.parent / f"{output_base_path.name}.mp4"
+                current_part = produced_files[0]
+                try:
+                    current_part.rename(legacy_name)
+                    logging.info(f"Renamed single segment {current_part.name} -> {legacy_name.name} for backwards compatibility.")
+                    produced_files = [legacy_name]
+                except OSError as e:
+                    logging.warning(f"Could not rename {current_part} to {legacy_name}: {e}")
+
+            normalized_files = []
+            for video_file in produced_files:
+                if video_file.suffix.lower() == ".mp4":
+                    normalized_files.append(video_file)
+                    continue
+                target = video_file.with_suffix(".mp4")
+                if target.exists():
+                    target = video_file.with_name(video_file.name + ".mp4")
+                try:
+                    video_file.rename(target)
+                    logging.info(f"Normalized output filename '{video_file.name}' -> '{target.name}' (missing .mp4 extension).")
+                    normalized_files.append(target)
+                except OSError as e:
+                    logging.warning(f"Failed to append .mp4 extension to {video_file}: {e}")
+                    normalized_files.append(video_file)
+
+            produced_files = normalized_files
+
+            for video_file in produced_files:
+                logging.info(f"Encoding pipeline finalized segment: {video_file}")
+            logging.info("Encoding pipeline finished.")
+        total_payload_size = sum(f.stat().st_size for f in files_to_encode)
+        logging.info("--- ENCODING SUMMARY (Overall) ---")
+        logging.info(f"Original Input: {input_path}")
+        logging.info(f"Total Payload Size (after 7z/par2): {total_payload_size / 1024:.2f} KB")
+        logging.info("Output Video Files:")
+        for video_file in produced_files:
+            if video_file.exists():
+                video_size = video_file.stat().st_size
+                logging.info(f"  - {video_file} ({video_size / (1024*1024):.2f} MB)")
+                if total_payload_size > 0:
+                    logging.info(f"    Storage Ratio: {video_size / total_payload_size:.2f}")
+            else:
+                logging.info(f"  - {video_file} (missing on disk)")
+        encode_elapsed = time.perf_counter() - encode_start
+        logging.info(f"Encoding completed successfully in {encode_elapsed:.1f}s ({encode_elapsed/60:.2f} min).")
     finally:
-        frame_queue.put(None)
-        logging.info("Waiting for producer thread to finish...")
-        producer.join()
-        logging.info("Producer thread finished. Waiting for FFmpeg consumer to flush to disk...")
-        consumer.join()
-        logging.info("FFmpeg consumer confirmed all segments written.")
-        if consumer.output_paths:
-            produced_files = consumer.output_paths.copy()
-        else:
-            default_name = output_base_path if output_base_path.suffix else output_base_path.parent / f"{output_base_path.name}.mp4"
-            produced_files = [default_name]
-
-        segmentation_enabled = config.get("MAX_VIDEO_SEGMENT_HOURS", 11)
-        if segmentation_enabled and len(produced_files) == 1 and produced_files[0].name.endswith("_part001.mp4"):
-            legacy_name = output_base_path if output_base_path.suffix else output_base_path.parent / f"{output_base_path.name}.mp4"
-            current_part = produced_files[0]
-            try:
-                current_part.rename(legacy_name)
-                logging.info(f"Renamed single segment {current_part.name} -> {legacy_name.name} for backwards compatibility.")
-                produced_files = [legacy_name]
-            except OSError as e:
-                logging.warning(f"Could not rename {current_part} to {legacy_name}: {e}")
-
-        normalized_files = []
-        for video_file in produced_files:
-            if video_file.suffix.lower() == ".mp4":
-                normalized_files.append(video_file)
-                continue
-            target = video_file.with_suffix(".mp4")
-            if target.exists():
-                target = video_file.with_name(video_file.name + ".mp4")
-            try:
-                video_file.rename(target)
-                logging.info(f"Normalized output filename '{video_file.name}' -> '{target.name}' (missing .mp4 extension).")
-                normalized_files.append(target)
-            except OSError as e:
-                logging.warning(f"Failed to append .mp4 extension to {video_file}: {e}")
-                normalized_files.append(video_file)
-
-        produced_files = normalized_files
-
-        for video_file in produced_files:
-            logging.info(f"Encoding pipeline finalized segment: {video_file}")
-        logging.info("Encoding pipeline finished.")
-    total_payload_size = sum(f.stat().st_size for f in files_to_encode)
-    logging.info("--- ENCODING SUMMARY (Overall) ---")
-    logging.info(f"Original Input: {input_path}")
-    logging.info(f"Total Payload Size (after 7z/par2): {total_payload_size / 1024:.2f} KB")
-    logging.info("Output Video Files:")
-    for video_file in produced_files:
-        if video_file.exists():
-            video_size = video_file.stat().st_size
-            logging.info(f"  - {video_file} ({video_size / (1024*1024):.2f} MB)")
-            if total_payload_size > 0:
-                logging.info(f"    Storage Ratio: {video_size / total_payload_size:.2f}")
-        else:
-            logging.info(f"  - {video_file} (missing on disk)")
+        cleanup_temp_dir(temp_dir, "encoding temp")
 
 # --- Decoding Pipeline ---
 
@@ -1115,204 +1181,228 @@ def decode_data_frames_gpu(frame_batch: torch.Tensor, derived_params: Dict, tota
     return hamming_decode_gpu(valid_bits, h_matrix, hamming_k, syndrome_table)
 
 def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optional[str], config: Dict, device: torch.device):
+    decode_start = time.perf_counter()
     logging.info(f"Starting decoding for '{input_path_str}'...")
     temp_dir = output_dir / TEMP_DECODE_DIR; temp_dir.mkdir(exist_ok=True)
-    raw_inputs = [segment.strip() for segment in input_path_str.split(',') if segment.strip()]
-    if not raw_inputs:
-        logging.error("No input video paths provided for decoding.")
-        return
-
-    video_paths = []
-    for segment in raw_inputs:
-        candidate = Path(segment).expanduser()
-        if not candidate.exists():
-            logging.error(f"Input video not found: {candidate}")
-            return
-        video_paths.append(candidate)
-
-    primary_video = video_paths[0]
-    multi_segment = len(video_paths) > 1
-    if multi_segment:
-        segment_lines = "\n".join(f"  [{idx+1}] {path}" for idx, path in enumerate(video_paths))
-        logging.info(f"Decoding will concatenate {len(video_paths)} segments:\n{segment_lines}")
-    else:
-        logging.info(f"Decoding single video: {primary_video}")
-
-    # Extract barcode frame at full 720x720
-    barcode_frame = extract_frame_as_tensor(primary_video, 0, temp_dir, config, frame_type='barcode')
-    if barcode_frame is None: logging.error("Failed to extract barcode frame."); return
-    barcode_data = decode_barcode(barcode_frame)
-    if barcode_data is None: return
-    num_info_frames, _ = barcode_data
-    
-    # Extract info frames at 16x16 (INFO_K_SIDE)
-    if multi_segment:
-        info_reader = SegmentedDataFrameReader(video_paths, config, temp_dir, initial_frame_offset=1, frame_type='info')
-        info_frames_tensor = info_reader.fetch_frames(num_info_frames)
-        if info_frames_tensor is None or info_frames_tensor.shape[0] < num_info_frames:
-            logging.error("Failed to extract required info frames across provided segments.")
-            return
-        info_frames = info_frames_tensor[:num_info_frames]
-        logging.info(f"Read {info_frames.shape[0]} info frames from barcode ({num_info_frames} reported). Decoding them...")
-    else:
-        info_frames = []
-        for i in range(num_info_frames):
-            frame = extract_frame_as_tensor(primary_video, i + 1, temp_dir, config, frame_type='info')
-            if frame is None:
-                logging.error(f"Failed to extract info frame {i+1}. Aborting.")
-                return
-            info_frames.append(frame)
-        info_frames = torch.stack(info_frames)
-        logging.info(f"Read {info_frames.shape[0]} info frames from barcode ({num_info_frames} reported). Decoding them...")
-    
-    info_syndrome_table = build_syndrome_lookup_table(INFO_H_MATRIX_TENSOR.to(device))
-    session_params = decode_info_frames(info_frames, device, info_syndrome_table)
-    if session_params is None: logging.error("Failed to recover session parameters."); return
-    logging.info("Successfully decoded info JSON.")
-    
-    # DIAGNOSTIC: Log what we decoded
-    logging.info(f"Decoded manifest fields: info_frame_count={session_params.get('info_frame_count')}, data_frame_count={session_params.get('data_frame_count')}")
-    
-    # DIAGNOSTIC: Check if decoded info_frame_count matches barcode
-    decoded_info_frame_count = session_params.get("info_frame_count", num_info_frames)
-    if decoded_info_frame_count != num_info_frames:
-        logging.warning(f"⚠ Info frame count mismatch: barcode says {num_info_frames}, but JSON says {decoded_info_frame_count}")
-        logging.warning(f"   This may indicate an encoding issue. Using JSON value: {decoded_info_frame_count}")
-        num_info_frames = decoded_info_frame_count
-
-    data_output_dir = temp_dir / ASSEMBLED_FILES_DIR; data_output_dir.mkdir(exist_ok=True)
-    data_queue = queue.Queue(maxsize=128)
-    data_writer = DataWriterThread(data_queue, session_params, data_output_dir)
-    data_writer.start()
-
-    derived_params = get_derived_encoding_params(config, device)
-    derived_params['h_matrix'] = DATA_H_MATRIX_TENSOR.to(device)
-    derived_params['syndrome_table'] = build_syndrome_lookup_table(derived_params['h_matrix'])
-
-    total_payload_bytes = sum(f['size'] for f in session_params['file_manifest_detailed'])
-    total_payload_bits = total_payload_bytes * 8
-    total_encoded_bits_budget = session_params.get("total_encoded_data_bits")
-    if total_encoded_bits_budget is None:
-        hamming_k = derived_params['hamming_k']
-        hamming_n = derived_params['hamming_n']
-        if hamming_k > 0:
-            total_encoded_bits_budget = math.ceil(total_payload_bits / hamming_k) * hamming_n
-        else:
-            total_encoded_bits_budget = 0
-        logging.info(f"   Derived encoded bit budget from manifest: {total_encoded_bits_budget} bits")
-    else:
-        logging.info(f"   Manifest advertised encoded bit budget: {total_encoded_bits_budget} bits")
-
-    # Calculate frame offset (data frames start after barcode + info frames)
-    frame_idx_offset = 1 + num_info_frames
-    
-    # Use the data frame count from the manifest if available, otherwise calculate it
-    if 'data_frame_count' in session_params:
-        num_data_frames = session_params['data_frame_count']
-        logging.info(f"[OK] Using data_frame_count from manifest: {num_data_frames} frames (padding frames will be ignored)")
-    else:
-        # Fallback: calculate from file sizes (for backwards compatibility)
-        payload_bytes_per_frame = derived_params['payload_bits_data'] / 8
-        total_payload_bytes = sum(f['size'] for f in session_params['file_manifest_detailed'])
-        num_data_frames = math.ceil(total_payload_bytes / payload_bytes_per_frame) if payload_bytes_per_frame > 0 else 0
-        logging.info(f"[WARN] Calculated data_frame_count (fallback): {num_data_frames} frames")
-    
-    logging.info(f"Data extraction will process frames {frame_idx_offset} to {frame_idx_offset + num_data_frames - 1} (total {num_data_frames} data frames)")
-
-    reader = SegmentedDataFrameReader(video_paths, config, temp_dir, frame_idx_offset, frame_type='data') if multi_segment else None
-    batch_size = config['GPU_PROCESSOR_BATCH_SIZE']
-    total_corrected_data_codewords = 0
+    data_writer: Optional[DataWriterThread] = None
     try:
-        logging.info(f"DEBUG: Will extract data frames with indices {frame_idx_offset} to {frame_idx_offset + num_data_frames - 1}")
-        for i in range(0, num_data_frames, batch_size):
-            start, end = i, min(i + batch_size, num_data_frames)
-            logging.info(f"Processing data frame batch: logical indices {start+frame_idx_offset} to {end+frame_idx_offset-1} (frame_num offsets: {start} to {end-1})...")
-            batch_count = end - start
-            if reader is not None:
-                batch_tensor_cpu = reader.fetch_frames(batch_count)
+        raw_inputs = [segment.strip() for segment in input_path_str.split(',') if segment.strip()]
+        if not raw_inputs:
+            logging.error("No input video paths provided for decoding.")
+            return
 
-                if batch_tensor_cpu is None or batch_tensor_cpu.shape[0] == 0:
-                    logging.warning("No more frames available across provided segments. Padding remaining frames with zeros.")
-                    batch_tensor_cpu = torch.zeros((batch_count, config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
-                elif batch_tensor_cpu.shape[0] < batch_count:
-                    deficit = batch_count - batch_tensor_cpu.shape[0]
-                    logging.warning(f"Recovered {batch_tensor_cpu.shape[0]} frame(s); padding remaining {deficit} with zeros.")
-                    padding = torch.zeros((deficit, config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
-                    batch_tensor_cpu = torch.cat((batch_tensor_cpu, padding), dim=0)
+        video_paths = []
+        for segment in raw_inputs:
+            candidate = Path(segment).expanduser()
+            if not candidate.exists():
+                logging.error(f"Input video not found: {candidate}")
+                return
+            video_paths.append(candidate)
+
+        primary_video = video_paths[0]
+        multi_segment = len(video_paths) > 1
+        if multi_segment:
+            segment_lines = "\n".join(f"  [{idx+1}] {path}" for idx, path in enumerate(video_paths))
+            logging.info(f"Decoding will concatenate {len(video_paths)} segments:\n{segment_lines}")
+        else:
+            logging.info(f"Decoding single video: {primary_video}")
+
+        # Extract barcode frame at full 720x720
+        barcode_frame = extract_frame_as_tensor(primary_video, 0, temp_dir, config, frame_type='barcode')
+        if barcode_frame is None:
+            logging.error("Failed to extract barcode frame.")
+            return
+        barcode_data = decode_barcode(barcode_frame)
+        if barcode_data is None:
+            return
+        num_info_frames, _ = barcode_data
+        
+        # Extract info frames at 16x16 (INFO_K_SIDE)
+        if multi_segment:
+            info_reader = SegmentedDataFrameReader(video_paths, config, temp_dir, initial_frame_offset=1, frame_type='info')
+            info_frames_tensor = info_reader.fetch_frames(num_info_frames)
+            if info_frames_tensor is None or info_frames_tensor.shape[0] < num_info_frames:
+                logging.error("Failed to extract required info frames across provided segments.")
+                return
+            info_frames = info_frames_tensor[:num_info_frames]
+            logging.info(f"Read {info_frames.shape[0]} info frames from barcode ({num_info_frames} reported). Decoding them...")
+        else:
+            info_frames = []
+            for i in range(num_info_frames):
+                frame = extract_frame_as_tensor(primary_video, i + 1, temp_dir, config, frame_type='info')
+                if frame is None:
+                    logging.error(f"Failed to extract info frame {i+1}. Aborting.")
+                    return
+                info_frames.append(frame)
+            info_frames = torch.stack(info_frames)
+            logging.info(f"Read {info_frames.shape[0]} info frames from barcode ({num_info_frames} reported). Decoding them...")
+        
+        info_syndrome_table = build_syndrome_lookup_table(INFO_H_MATRIX_TENSOR.to(device))
+        session_params = decode_info_frames(info_frames, device, info_syndrome_table)
+        if session_params is None:
+            logging.error("Failed to recover session parameters.")
+            return
+        logging.info("Successfully decoded info JSON.")
+        
+        # DIAGNOSTIC: Log what we decoded
+        logging.info(f"Decoded manifest fields: info_frame_count={session_params.get('info_frame_count')}, data_frame_count={session_params.get('data_frame_count')}")
+        
+        # DIAGNOSTIC: Check if decoded info_frame_count matches barcode
+        decoded_info_frame_count = session_params.get("info_frame_count", num_info_frames)
+        if decoded_info_frame_count != num_info_frames:
+            logging.warning(f"⚠ Info frame count mismatch: barcode says {num_info_frames}, but JSON says {decoded_info_frame_count}")
+            logging.warning(f"   This may indicate an encoding issue. Using JSON value: {decoded_info_frame_count}")
+            num_info_frames = decoded_info_frame_count
+
+        apply_snapshot_to_config(config, session_params.get("encode_config_snapshot"))
+
+        data_output_dir = temp_dir / ASSEMBLED_FILES_DIR; data_output_dir.mkdir(exist_ok=True)
+        data_queue = queue.Queue(maxsize=128)
+        data_writer = DataWriterThread(data_queue, session_params, data_output_dir)
+        data_writer.start()
+
+        derived_params = get_derived_encoding_params(config, device)
+        derived_params['h_matrix'] = DATA_H_MATRIX_TENSOR.to(device)
+        derived_params['syndrome_table'] = build_syndrome_lookup_table(derived_params['h_matrix'])
+
+        total_payload_bytes = sum(f['size'] for f in session_params['file_manifest_detailed'])
+        total_payload_bits = total_payload_bytes * 8
+        total_encoded_bits_budget = session_params.get("total_encoded_data_bits")
+        if total_encoded_bits_budget is None:
+            hamming_k = derived_params['hamming_k']
+            hamming_n = derived_params['hamming_n']
+            if hamming_k > 0:
+                total_encoded_bits_budget = math.ceil(total_payload_bits / hamming_k) * hamming_n
             else:
-                batch_tensor_cpu = extract_frames_batch(
-                    primary_video,
-                    frame_idx_offset + start,
-                    batch_count,
-                    config,
-                    frame_type='data'
-                )
+                total_encoded_bits_budget = 0
+            logging.info(f"   Derived encoded bit budget from manifest: {total_encoded_bits_budget} bits")
+        else:
+            logging.info(f"   Manifest advertised encoded bit budget: {total_encoded_bits_budget} bits")
 
-                if batch_tensor_cpu is None:
-                    frame_batch = []
-                    for frame_num in range(start, end):
-                        actual_frame_index = frame_num + frame_idx_offset
-                        frame = extract_frame_as_tensor(primary_video, actual_frame_index, temp_dir, config, frame_type='data')
-                        if frame is None:
-                            logging.warning(f"Could not extract data frame at index {actual_frame_index}. Filling with zeros.")
-                            frame = torch.zeros((config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
-                        frame_batch.append(frame)
-                    if not frame_batch:
-                        break
-                    batch_tensor_cpu = torch.stack(frame_batch)
-                else:
-                    actual = batch_tensor_cpu.shape[0]
-                    if actual < batch_count:
-                        deficit = batch_count - actual
-                        logging.warning(f"Padding {deficit} missing frame(s) after batched extraction.")
+        # Calculate frame offset (data frames start after barcode + info frames)
+        frame_idx_offset = 1 + num_info_frames
+        
+        # Use the data frame count from the manifest if available, otherwise calculate it
+        if 'data_frame_count' in session_params:
+            num_data_frames = session_params['data_frame_count']
+            logging.info(f"[OK] Using data_frame_count from manifest: {num_data_frames} frames (padding frames will be ignored)")
+        else:
+            # Fallback: calculate from file sizes (for backwards compatibility)
+            payload_bytes_per_frame = derived_params['payload_bits_data'] / 8
+            total_payload_bytes = sum(f['size'] for f in session_params['file_manifest_detailed'])
+            num_data_frames = math.ceil(total_payload_bytes / payload_bytes_per_frame) if payload_bytes_per_frame > 0 else 0
+            logging.info(f"[WARN] Calculated data_frame_count (fallback): {num_data_frames} frames")
+        
+        logging.info(f"Data extraction will process frames {frame_idx_offset} to {frame_idx_offset + num_data_frames - 1} (total {num_data_frames} data frames)")
+
+        reader = SegmentedDataFrameReader(video_paths, config, temp_dir, frame_idx_offset, frame_type='data') if multi_segment else None
+        batch_size = config['GPU_PROCESSOR_BATCH_SIZE']
+        total_corrected_data_codewords = 0
+        try:
+            logging.info(f"DEBUG: Will extract data frames with indices {frame_idx_offset} to {frame_idx_offset + num_data_frames - 1}")
+            for i in range(0, num_data_frames, batch_size):
+                start, end = i, min(i + batch_size, num_data_frames)
+                logging.info(f"Processing data frame batch: logical indices {start+frame_idx_offset} to {end+frame_idx_offset-1} (frame_num offsets: {start} to {end-1})...")
+                batch_count = end - start
+                if reader is not None:
+                    batch_tensor_cpu = reader.fetch_frames(batch_count)
+
+                    if batch_tensor_cpu is None or batch_tensor_cpu.shape[0] == 0:
+                        logging.warning("No more frames available across provided segments. Padding remaining frames with zeros.")
+                        batch_tensor_cpu = torch.zeros((batch_count, config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
+                    elif batch_tensor_cpu.shape[0] < batch_count:
+                        deficit = batch_count - batch_tensor_cpu.shape[0]
+                        logging.warning(f"Recovered {batch_tensor_cpu.shape[0]} frame(s); padding remaining {deficit} with zeros.")
                         padding = torch.zeros((deficit, config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
                         batch_tensor_cpu = torch.cat((batch_tensor_cpu, padding), dim=0)
+                else:
+                    batch_tensor_cpu = extract_frames_batch(
+                        primary_video,
+                        frame_idx_offset + start,
+                        batch_count,
+                        config,
+                        frame_type='data'
+                    )
 
-            batch_tensor = batch_tensor_cpu.to(device)
-            bits_per_frame_encoded = derived_params['total_encoded_bits_to_store_data']
-            batch_frame_count = batch_tensor_cpu.shape[0]
-            batch_bits = batch_frame_count * bits_per_frame_encoded
-            bits_argument = None
-            if total_encoded_bits_budget is not None:
-                bits_argument = min(total_encoded_bits_budget, batch_bits)
-                if bits_argument <= 0:
-                    logging.info("No remaining encoded bits; skipping the rest of the data frames.")
+                    if batch_tensor_cpu is None:
+                        frame_batch = []
+                        for frame_num in range(start, end):
+                            actual_frame_index = frame_num + frame_idx_offset
+                            frame = extract_frame_as_tensor(primary_video, actual_frame_index, temp_dir, config, frame_type='data')
+                            if frame is None:
+                                logging.warning(f"Could not extract data frame at index {actual_frame_index}. Filling with zeros.")
+                                frame = torch.zeros((config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
+                            frame_batch.append(frame)
+                        if not frame_batch:
+                            break
+                        batch_tensor_cpu = torch.stack(frame_batch)
+                    else:
+                        actual = batch_tensor_cpu.shape[0]
+                        if actual < batch_count:
+                            deficit = batch_count - actual
+                            logging.warning(f"Padding {deficit} missing frame(s) after batched extraction.")
+                            padding = torch.zeros((deficit, config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
+                            batch_tensor_cpu = torch.cat((batch_tensor_cpu, padding), dim=0)
+
+                batch_tensor = batch_tensor_cpu.to(device)
+                bits_per_frame_encoded = derived_params['total_encoded_bits_to_store_data']
+                batch_frame_count = batch_tensor_cpu.shape[0]
+                batch_bits = batch_frame_count * bits_per_frame_encoded
+                bits_argument = None
+                if total_encoded_bits_budget is not None:
+                    bits_argument = min(total_encoded_bits_budget, batch_bits)
+                    if bits_argument <= 0:
+                        logging.info("No remaining encoded bits; skipping the rest of the data frames.")
+                        break
+                    total_encoded_bits_budget = max(0, total_encoded_bits_budget - bits_argument)
+                decoded_bits, num_corrections = decode_data_frames_gpu(batch_tensor, derived_params, bits_argument)
+                total_corrected_data_codewords += num_corrections
+                data_queue.put(np.packbits(decoded_bits.cpu().numpy()).tobytes())
+
+        except KeyboardInterrupt:
+            logging.warning("Keyboard interrupt during data decoding.")
+        finally:
+            data_queue.put(None)
+            if data_writer is not None:
+                data_writer.join()
+
+        logging.info("--- DECODING SUMMARY (Data Frames) ---")
+        logging.info(f"Total codewords with errors corrected: {total_corrected_data_codewords}")
+
+        logging.info("Data reconstruction finished. Starting final recovery (par2/7z).")
+        par2_path = config["PAR2_PATH"]
+        main_par2_file = next(data_output_dir.glob("recovery_set.par2"), None)
+        if main_par2_file:
+            run_command([par2_path, "r", "-a", main_par2_file.name], cwd=str(data_output_dir))
+        
+        sz_path = config["SEVENZIP_PATH"]
+        archive_file = next(data_output_dir.glob("*.7z.001"), next(data_output_dir.glob("*_data_archive.7z"), None))
+        if archive_file:
+            final_extraction_dir = output_dir / "Decoded_Files"
+            final_extraction_dir.mkdir(exist_ok=True)
+            current_password = password
+            while True:
+                cmd = [sz_path, "x", "-y", f"-o{final_extraction_dir}", str(archive_file)]
+                if current_password:
+                    cmd.insert(2, f"-p{current_password}")
+                if run_command(cmd, cwd=str(data_output_dir)):
+                    logging.info(f"Extraction successful. Files are in '{final_extraction_dir}'")
                     break
-                total_encoded_bits_budget = max(0, total_encoded_bits_budget - bits_argument)
-            decoded_bits, num_corrections = decode_data_frames_gpu(batch_tensor, derived_params, bits_argument)
-            total_corrected_data_codewords += num_corrections
-            data_queue.put(np.packbits(decoded_bits.cpu().numpy()).tobytes())
-
-    except KeyboardInterrupt:
-        logging.warning("Keyboard interrupt during data decoding.")
+                if session_params.get("is_password_protected"):
+                    logging.warning("Extraction failed, likely due to incorrect password.")
+                    current_password = getpass.getpass("Please enter the correct password (or press Enter to skip): ")
+                    if not current_password:
+                        logging.warning("Skipping final extraction.")
+                        break
+                else:
+                    logging.error("Extraction failed for a non-password protected archive.")
+                    break
+        
+        logging.info("Decoding process completed.")
+        decode_elapsed = time.perf_counter() - decode_start
+        logging.info(f"Decoding completed successfully in {decode_elapsed:.1f}s ({decode_elapsed/60:.2f} min).")
     finally:
-        data_queue.put(None); data_writer.join()
-
-    logging.info("--- DECODING SUMMARY (Data Frames) ---")
-    logging.info(f"Total codewords with errors corrected: {total_corrected_data_codewords}")
-
-    logging.info("Data reconstruction finished. Starting final recovery (par2/7z).")
-    par2_path = config["PAR2_PATH"]
-    main_par2_file = next(data_output_dir.glob("recovery_set.par2"), None)
-    if main_par2_file: run_command([par2_path, "r", "-a", main_par2_file.name], cwd=str(data_output_dir))
-    
-    sz_path = config["SEVENZIP_PATH"]
-    archive_file = next(data_output_dir.glob("*.7z.001"), next(data_output_dir.glob("*_data_archive.7z"), None))
-    if archive_file:
-        final_extraction_dir = output_dir / "Decoded_Files"
-        final_extraction_dir.mkdir(exist_ok=True)
-        current_password = password
-        while True:
-            cmd = [sz_path, "x", "-y", f"-o{final_extraction_dir}", str(archive_file)]
-            if current_password: cmd.insert(2, f"-p{current_password}")
-            if run_command(cmd, cwd=str(data_output_dir)): logging.info(f"Extraction successful. Files are in '{final_extraction_dir}'"); break
-            if session_params.get("is_password_protected"):
-                logging.warning("Extraction failed, likely due to incorrect password.")
-                current_password = getpass.getpass("Please enter the correct password (or press Enter to skip): ")
-                if not current_password: logging.warning("Skipping final extraction."); break
-            else: logging.error("Extraction failed for a non-password protected archive."); break
-    
-    logging.info("Decoding process completed.")
+        cleanup_temp_dir(temp_dir, "decoding temp")
 
 # --- Main Entry Point ---
 

@@ -25,7 +25,7 @@ Turn any file or folder into one or more MP4 videos (and back again) using PyTor
 
 Use the provided dependency scripts to verify your environment quickly:
 
-- Windows PowerShell: `.\tools\check_deps_windows.ps1`
+- Windows PowerShell: `.\tools\check_deps_windows.cmd`
 - Linux/macOS Bash: `./tools/check_deps_linux.sh`
 
 Each script lists missing dependencies and suggests installation steps (including CUDA checks).
