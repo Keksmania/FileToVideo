@@ -11,8 +11,9 @@ import subprocess
 import sys
 import threading
 import queue
+from collections import deque
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Deque, Union
 import io
 from PIL import Image
 import filecmp
@@ -89,9 +90,11 @@ def load_config() -> Dict[str, Any]:
         "FFMPEG_PATH": "ffmpeg", "SEVENZIP_PATH": "7z", "PAR2_PATH": "par2",
         "VIDEO_WIDTH": 720, "VIDEO_HEIGHT": 720, "VIDEO_FPS": 60,
         "DATA_K_SIDE": 180, "NUM_COLORS_DATA": 2,
-        "PAR2_REDUNDANCY_PERCENT": 10, "X264_CRF": 32,
+        "PAR2_REDUNDANCY_PERCENT": 5, "X264_CRF": 32,
         "CPU_PRODUCER_CHUNK_MB": 128, "GPU_PROCESSOR_BATCH_SIZE": 2048,
-        "MAX_VIDEO_SEGMENT_HOURS": 11
+        "MAX_VIDEO_SEGMENT_HOURS": 11,
+        "GPU_OVERLAP_STREAMS": 8,
+        "PIPELINE_QUEUE_DEPTH": 8
     }
     if not config_path.exists():
         logging.info(f"Config file not found. Creating default at '{config_path}'")
@@ -153,6 +156,19 @@ def cleanup_temp_dir(temp_path: Path, label: str) -> None:
         except Exception as e:
             logging.warning(f"Failed to remove {label} directory '{temp_path}': {e}")
 
+
+def pin_tensor_if_possible(tensor: torch.Tensor) -> torch.Tensor:
+    """Pin CPU tensor memory to enable async GPU transfers when CUDA is available."""
+    if tensor.device.type != "cpu":
+        return tensor
+    if not torch.cuda.is_available():
+        return tensor
+    try:
+        return tensor.pin_memory()
+    except RuntimeError:
+        logging.debug("pin_memory not supported for this tensor; continuing without pinning.")
+        return tensor
+
 # --- Core Utility Functions ---
 
 def run_command(command: List[str], cwd: Optional[str] = None) -> bool:
@@ -198,6 +214,36 @@ def tensor_to_frame(bits_tensor: torch.Tensor, k_side: int, palette: torch.Tenso
     num_channels = palette.shape[1]
     frame_tensor = pixel_data.view(k_side, k_side, num_channels)
     return frame_tensor.to(torch.uint8)
+
+
+def bit_chunks_to_frame_batch(
+    frame_bit_chunks: torch.Tensor,
+    k_side: int,
+    palette: torch.Tensor,
+    bits_per_color: int
+) -> torch.Tensor:
+    """Convert encoded bit chunks for many frames into actual RGB tensors in one shot."""
+    if frame_bit_chunks.numel() == 0:
+        return torch.empty(0, k_side, k_side, palette.shape[1], dtype=torch.uint8, device=frame_bit_chunks.device)
+
+    device = frame_bit_chunks.device
+    num_frames = frame_bit_chunks.shape[0]
+    num_pixels = k_side * k_side
+    required_bits = num_pixels * bits_per_color
+    current_bits = frame_bit_chunks.shape[1]
+    if current_bits < required_bits:
+        pad_n = required_bits - current_bits
+        frame_bit_chunks = torch.nn.functional.pad(frame_bit_chunks, (0, pad_n))
+    elif current_bits > required_bits:
+        frame_bit_chunks = frame_bit_chunks[:, :required_bits]
+
+    bit_groups = frame_bit_chunks.view(num_frames, num_pixels, bits_per_color)
+    powers_of_2 = 2 ** torch.arange(bits_per_color - 1, -1, -1, device=device, dtype=torch.long)
+    palette = palette.to(device)
+    palette_indices = torch.matmul(bit_groups.float(), powers_of_2.float()).long()
+    pixel_data = torch.nn.functional.embedding(palette_indices, palette)
+    num_channels = palette.shape[1]
+    return pixel_data.view(num_frames, k_side, k_side, num_channels).to(torch.uint8)
 
 def generate_palette_tensor(num_colors: int, device: torch.device) -> torch.Tensor:
     if num_colors <= 0 or (num_colors & (num_colors - 1)) != 0:
@@ -252,7 +298,14 @@ def build_syndrome_lookup_table(h_matrix: torch.Tensor) -> torch.Tensor:
                 error_patterns[syndrome_idx, i] = 1
     return error_patterns
 
-def hamming_decode_gpu(received_bits: torch.Tensor, h_matrix: torch.Tensor, k: int, syndrome_table: torch.Tensor, debug: bool = False) -> Tuple[torch.Tensor, int]:
+def hamming_decode_gpu(
+    received_bits: torch.Tensor,
+    h_matrix: torch.Tensor,
+    k: int,
+    syndrome_table: torch.Tensor,
+    debug: bool = False,
+    return_error_tensor: bool = False
+) -> Tuple[torch.Tensor, Union[int, torch.Tensor]]:
     n = h_matrix.shape[1]
     device = received_bits.device
     codewords = received_bits.view(-1, n)
@@ -262,7 +315,11 @@ def hamming_decode_gpu(received_bits: torch.Tensor, h_matrix: torch.Tensor, k: i
     powers_of_2 = 2 ** torch.arange(m - 1, -1, -1, device=device, dtype=torch.long)
     syndrome_indices = torch.matmul(syndrome.float(), powers_of_2.float()).long()
     
-    num_errors = (syndrome_indices > 0).sum().item()
+    error_count_tensor = (syndrome_indices > 0).sum()
+    if return_error_tensor:
+        num_errors: Union[int, torch.Tensor] = error_count_tensor
+    else:
+        num_errors = int(error_count_tensor.item())
     
     if debug and codewords.shape[0] > 0:
         # Log first 10 codewords' syndrome info
@@ -451,9 +508,11 @@ def encode_data_frames_gpu(bits_tensor_gpu: torch.Tensor, derived_params: Dict) 
     else:
         coded_bits_flat = coded_bits_flat[:needed]
     frame_bit_chunks = coded_bits_flat.view(num_frames, bits_per_frame_encoded)
-    all_frames = [tensor_to_frame(frame_bit_chunks[i], k_side, palette, bits_per_color) for i in range(num_frames)]
-    logging.info(f"encode_data_frames_gpu: produced {len(all_frames)} frames (k_side={k_side}), bits_per_frame={bits_per_frame_encoded}, actual_payload={actual_payload_bits} bits")
-    return torch.stack(all_frames)
+    frames_tensor = bit_chunks_to_frame_batch(frame_bit_chunks, k_side, palette, bits_per_color)
+    logging.info(
+        f"encode_data_frames_gpu: produced {frames_tensor.shape[0]} frames (k_side={k_side}), bits_per_frame={bits_per_frame_encoded}, actual_payload={actual_payload_bits} bits"
+    )
+    return frames_tensor
 
 def get_derived_encoding_params(config: Dict, device: torch.device) -> Dict:
     params = config.copy()
@@ -664,10 +723,35 @@ def encode_orchestrator(input_path: Path, output_dir: Path, password: Optional[s
         if barcode_frame_batch is None:
             return
         output_base_path = output_dir / f"{input_path.stem}_F2YT"
-        data_queue, frame_queue = queue.Queue(maxsize=4), queue.Queue(maxsize=4)
+        queue_depth = max(4, int(config.get("PIPELINE_QUEUE_DEPTH", 8)))
+        data_queue, frame_queue = queue.Queue(maxsize=queue_depth), queue.Queue(maxsize=queue_depth)
         producer = DataProducerThread(files_to_encode, data_queue, derived_params)
         consumer = FFmpegConsumerThread(frame_queue, output_base_path, config)
         producer.start(); consumer.start()
+        use_cuda = device.type == "cuda"
+        overlap_streams = max(1, int(config.get("GPU_OVERLAP_STREAMS", 2))) if use_cuda else 1
+        encode_streams = [torch.cuda.Stream(device=device) for _ in range(overlap_streams)] if use_cuda else []
+        if use_cuda:
+            logging.info(f"Using {overlap_streams} CUDA stream(s) for overlapped encode batches.")
+        inflight_batches: Deque[Tuple[Optional[torch.cuda.Stream], torch.Tensor]] = deque()
+        max_inflight = len(encode_streams) if encode_streams else 1
+        next_stream_idx = 0
+
+        def flush_encoded_batches(force: bool = False) -> None:
+            while inflight_batches and (force or len(inflight_batches) >= max_inflight):
+                stream, cpu_tensor = inflight_batches.popleft()
+                if stream is not None:
+                    stream.synchronize()
+                if cpu_tensor is None or cpu_tensor.numel() == 0:
+                    continue
+                ready_tensor = cpu_tensor.contiguous()
+                try:
+                    num_frames_out = ready_tensor.shape[0]
+                    logging.info(f"Encoder produced pixel tensor: frames={num_frames_out}, shape={tuple(ready_tensor.shape)}")
+                except Exception:
+                    logging.debug("Encoder produced pixel tensor (unable to inspect shape).")
+                frame_queue.put(ready_tensor)
+
         try:
             logging.info("--- Starting main processing pipeline ---")
             frame_queue.put(barcode_frame_batch)
@@ -676,17 +760,24 @@ def encode_orchestrator(input_path: Path, output_dir: Path, password: Optional[s
                 bits_tensor_cpu = data_queue.get()
                 if bits_tensor_cpu is None:
                     break
-                bits_tensor_gpu = bits_tensor_cpu.to(device)
-                pixel_tensor_gpu = encode_data_frames_gpu(bits_tensor_gpu, derived_params)
-                if pixel_tensor_gpu.numel() == 0:
-                    continue
-                # Diagnostic: log how many frames and basic stats
-                try:
-                    num_frames_out = pixel_tensor_gpu.shape[0]
-                    logging.info(f"Encoder produced pixel tensor: frames={num_frames_out}, shape={tuple(pixel_tensor_gpu.shape)}")
-                except Exception:
-                    logging.debug("Encoder produced pixel tensor (unable to inspect shape).")
-                frame_queue.put(pixel_tensor_gpu)
+                if use_cuda:
+                    pinned_bits = pin_tensor_if_possible(bits_tensor_cpu)
+                    stream = encode_streams[next_stream_idx]
+                    next_stream_idx = (next_stream_idx + 1) % len(encode_streams)
+                    with torch.cuda.stream(stream):
+                        bits_tensor_gpu = pinned_bits.to(device, non_blocking=True)
+                        pixel_tensor_gpu = encode_data_frames_gpu(bits_tensor_gpu, derived_params)
+                        if pixel_tensor_gpu.numel() == 0:
+                            continue
+                        pixel_tensor_cpu = pixel_tensor_gpu.to("cpu", non_blocking=True)
+                    inflight_batches.append((stream, pixel_tensor_cpu))
+                else:
+                    pixel_tensor_cpu = encode_data_frames_gpu(bits_tensor_cpu.to(device), derived_params)
+                    if pixel_tensor_cpu.numel() == 0:
+                        continue
+                    inflight_batches.append((None, pixel_tensor_cpu.cpu()))
+                flush_encoded_batches()
+            flush_encoded_batches(force=True)
         except KeyboardInterrupt:
             logging.warning("Keyboard interrupt detected. Shutting down pipeline.")
             producer.stop(); consumer.stop()
@@ -1120,7 +1211,12 @@ def decode_info_frames(frames, device: torch.device, syndrome_table: Optional[to
 
     return decoded_obj
 
-def decode_data_frames_gpu(frame_batch: torch.Tensor, derived_params: Dict, total_encoded_bits: Optional[int] = None) -> Tuple[torch.Tensor, int]:
+def decode_data_frames_gpu(
+    frame_batch: torch.Tensor,
+    derived_params: Dict,
+    total_encoded_bits: Optional[int] = None,
+    return_error_tensor: bool = False
+) -> Tuple[torch.Tensor, Union[int, torch.Tensor]]:
     device = frame_batch.device
     palette = derived_params['data_palette'].to(device)
     bits_per_color = derived_params['bits_per_pixel_data']
@@ -1178,7 +1274,13 @@ def decode_data_frames_gpu(frame_batch: torch.Tensor, derived_params: Dict, tota
         logging.info(f"  Trimming {delta} padding bits after per-frame alignment to match actual payload.")
         valid_bits = valid_bits[:total_encoded_bits]
 
-    return hamming_decode_gpu(valid_bits, h_matrix, hamming_k, syndrome_table)
+    return hamming_decode_gpu(
+        valid_bits,
+        h_matrix,
+        hamming_k,
+        syndrome_table,
+        return_error_tensor=return_error_tensor
+    )
 
 def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optional[str], config: Dict, device: torch.device):
     decode_start = time.perf_counter()
@@ -1298,6 +1400,31 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         reader = SegmentedDataFrameReader(video_paths, config, temp_dir, frame_idx_offset, frame_type='data') if multi_segment else None
         batch_size = config['GPU_PROCESSOR_BATCH_SIZE']
         total_corrected_data_codewords = 0
+        use_cuda = device.type == "cuda"
+        overlap_streams = max(1, int(config.get("GPU_OVERLAP_STREAMS", 2))) if use_cuda else 1
+        decode_streams = [torch.cuda.Stream(device=device) for _ in range(overlap_streams)] if use_cuda else []
+        if use_cuda:
+            logging.info(f"Using {overlap_streams} CUDA stream(s) for overlapped decode batches.")
+        inflight_decodes: Deque[Tuple[Optional[torch.cuda.Stream], torch.Tensor, Union[int, torch.Tensor]]] = deque()
+        max_inflight_decodes = len(decode_streams) if decode_streams else 1
+        next_decode_stream = 0
+
+        def flush_decoded_batches(force: bool = False) -> None:
+            nonlocal total_corrected_data_codewords
+            while inflight_decodes and (force or len(inflight_decodes) >= max_inflight_decodes):
+                stream, bits_cpu, corrections_value = inflight_decodes.popleft()
+                if stream is not None:
+                    stream.synchronize()
+                if bits_cpu is None or bits_cpu.numel() == 0:
+                    continue
+                ready_bits = bits_cpu.contiguous()
+                if isinstance(corrections_value, torch.Tensor):
+                    corrections_int = int(corrections_value.item())
+                else:
+                    corrections_int = int(corrections_value)
+                total_corrected_data_codewords += corrections_int
+                data_queue.put(np.packbits(ready_bits.cpu().numpy()).tobytes())
+
         try:
             logging.info(f"DEBUG: Will extract data frames with indices {frame_idx_offset} to {frame_idx_offset + num_data_frames - 1}")
             for i in range(0, num_data_frames, batch_size):
@@ -1344,7 +1471,6 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
                             padding = torch.zeros((deficit, config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
                             batch_tensor_cpu = torch.cat((batch_tensor_cpu, padding), dim=0)
 
-                batch_tensor = batch_tensor_cpu.to(device)
                 bits_per_frame_encoded = derived_params['total_encoded_bits_to_store_data']
                 batch_frame_count = batch_tensor_cpu.shape[0]
                 batch_bits = batch_frame_count * bits_per_frame_encoded
@@ -1355,9 +1481,37 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
                         logging.info("No remaining encoded bits; skipping the rest of the data frames.")
                         break
                     total_encoded_bits_budget = max(0, total_encoded_bits_budget - bits_argument)
-                decoded_bits, num_corrections = decode_data_frames_gpu(batch_tensor, derived_params, bits_argument)
-                total_corrected_data_codewords += num_corrections
-                data_queue.put(np.packbits(decoded_bits.cpu().numpy()).tobytes())
+
+                if use_cuda:
+                    pinned_batch = pin_tensor_if_possible(batch_tensor_cpu)
+                    stream = decode_streams[next_decode_stream]
+                    next_decode_stream = (next_decode_stream + 1) % len(decode_streams)
+                    with torch.cuda.stream(stream):
+                        batch_tensor = pinned_batch.to(device, non_blocking=True)
+                        decoded_bits, num_corrections = decode_data_frames_gpu(
+                            batch_tensor,
+                            derived_params,
+                            bits_argument,
+                            return_error_tensor=True
+                        )
+                        if decoded_bits.numel() == 0:
+                            flush_decoded_batches()
+                            continue
+                        decoded_bits_cpu = decoded_bits.to("cpu", non_blocking=True)
+                    inflight_decodes.append((stream, decoded_bits_cpu, num_corrections))
+                else:
+                    decoded_bits, num_corrections = decode_data_frames_gpu(
+                        batch_tensor_cpu.to(device),
+                        derived_params,
+                        bits_argument
+                    )
+                    if decoded_bits.numel() == 0:
+                        flush_decoded_batches()
+                        continue
+                    inflight_decodes.append((None, decoded_bits.cpu(), num_corrections))
+
+                flush_decoded_batches()
+            flush_decoded_batches(force=True)
 
         except KeyboardInterrupt:
             logging.warning("Keyboard interrupt during data decoding.")
