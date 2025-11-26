@@ -90,8 +90,9 @@ def load_config() -> Dict[str, Any]:
         "FFMPEG_PATH": "ffmpeg", "SEVENZIP_PATH": "7z", "PAR2_PATH": "par2",
         "VIDEO_WIDTH": 720, "VIDEO_HEIGHT": 720, "VIDEO_FPS": 60,
         "DATA_K_SIDE": 180, "NUM_COLORS_DATA": 2,
-        "PAR2_REDUNDANCY_PERCENT": 5, "X264_CRF": 32,
-        "CPU_PRODUCER_CHUNK_MB": 128, "GPU_PROCESSOR_BATCH_SIZE": 2048,
+        "PAR2_REDUNDANCY_PERCENT": 5, "X264_CRF": 40,
+        "KEYINT_MAX": 2,
+        "CPU_PRODUCER_CHUNK_MB": 128, "GPU_PROCESSOR_BATCH_SIZE": 512,
         "MAX_VIDEO_SEGMENT_HOURS": 11,
         "GPU_OVERLAP_STREAMS": 8,
         "PIPELINE_QUEUE_DEPTH": 8
@@ -171,16 +172,31 @@ def pin_tensor_if_possible(tensor: torch.Tensor) -> torch.Tensor:
 
 # --- Core Utility Functions ---
 
-def run_command(command: List[str], cwd: Optional[str] = None) -> bool:
+def run_command(command: List[str], cwd: Optional[str] = None, stream_output: bool = False) -> bool:
+    """
+    Run a subprocess command.
+    
+    Args:
+        command: List of command parts.
+        cwd: Working directory.
+        stream_output: If True, prints stdout/stderr in real-time (useful for long PAR2 jobs).
+                       If False, captures output and logs only on error/debug.
+    """
     logging.info(f"Running command: {shlex.join(command)}")
     try:
-        process = subprocess.run(command, capture_output=True, text=True, check=False, cwd=cwd)
-        if process.stdout: logging.info(f"STDOUT:\n{process.stdout.strip()}")
-        if process.stderr:
-            is_ffmpeg_progress = 'frame=' in process.stderr and 'fps=' in process.stderr
-            log_level = logging.ERROR if process.returncode != 0 else logging.INFO
-            if not (is_ffmpeg_progress and process.returncode == 0):
-                 logging.log(log_level, f"STDERR:\n{process.stderr.strip()}")
+        if stream_output:
+            process = subprocess.run(command, check=False, cwd=cwd, text=True)
+        else:
+            process = subprocess.run(command, capture_output=True, text=True, check=False, cwd=cwd)
+        
+        if not stream_output:
+            if process.stdout: logging.info(f"STDOUT:\n{process.stdout.strip()}")
+            if process.stderr:
+                is_ffmpeg_progress = 'frame=' in process.stderr and 'fps=' in process.stderr
+                log_level = logging.ERROR if process.returncode != 0 else logging.INFO
+                if not (is_ffmpeg_progress and process.returncode == 0):
+                     logging.log(log_level, f"STDERR:\n{process.stderr.strip()}")
+        
         if process.returncode != 0:
             logging.error(f"Command failed with exit code {process.returncode}."); return False
         return True
@@ -277,11 +293,6 @@ def frame_to_bits_batch(frame_batch: torch.Tensor, palette: torch.Tensor, bits_p
     # Diagnostic: report counts and small sample of bits at INFO level
     total_bits = result.numel()
     logging.info(f"frame_to_bits_batch: extracted {total_bits} bits from {num_frames} frames ({h}x{w}), bits_per_color={bits_per_color}")
-    if total_bits > 0:
-        # show small samples to help detect end-of-frame padding patterns
-        sample_head = result[:16].cpu().numpy().tolist()
-        sample_tail = result[-16:].cpu().numpy().tolist()
-        logging.info(f"  sample head={sample_head} tail={sample_tail}")
     return result
 
 
@@ -306,6 +317,13 @@ def hamming_decode_gpu(
     debug: bool = False,
     return_error_tensor: bool = False
 ) -> Tuple[torch.Tensor, Union[int, torch.Tensor]]:
+    """
+    Decodes Hamming encoded bits.
+    NOTE: If more than 1 error is present in a block (which Hamming(7,4) cannot handle),
+    this function will still output a 'corrected' codeword based on the syndrome.
+    This implies we DO NOT throw away blocks with multiple errors. We pass the 'best guess'
+    miscorrected data to PAR2, ensuring synchronization of the bitstream is maintained.
+    """
     n = h_matrix.shape[1]
     device = received_bits.device
     codewords = received_bits.view(-1, n)
@@ -350,10 +368,49 @@ def prepare_files_for_encoding(input_path: Path, temp_dir: Path, config: Dict, p
     cmd = [sz_path, "a", "-y", str(payload_archive_path), str(file_to_compress)]
     if password: cmd.extend([f"-p{password}", "-mhe=on"])
     if not run_command(cmd): logging.error("Failed to compress data payload."); return None
+    
     logging.info("Creating PAR2 recovery files...")
     par2_base_path = temp_dir / "recovery_set"
     redundancy = config["PAR2_REDUNDANCY_PERCENT"]
-    cmd = [par2_path, "c", "-qq", f"-r{redundancy}", str(par2_base_path) + ".par2", str(payload_archive_path)]
+    
+    # --- BLOCK SIZE OPTIMIZATION ---
+    # For large files, the default 2000 blocks result in huge block sizes (e.g., 2.5MB for 5GB file).
+    # If the video has frequent noise (High CRF), a single bit error kills the whole 2.5MB block.
+    # We explicitly calculate a smaller block size (targeting ~256KB) to improve recovery granularity.
+    
+    archive_stat = payload_archive_path.stat()
+    file_size = archive_stat.st_size
+    target_block_size = 0
+    
+    # Check if user forced a specific size in config
+    if config.get("PAR2_BLOCK_SIZE_BYTES", 0) > 0:
+        target_block_size = int(config["PAR2_BLOCK_SIZE_BYTES"])
+        logging.info(f"Using configured PAR2 block size: {target_block_size} bytes")
+    else:
+        # Auto-calculate: Aim for ~256KB blocks, but keep total blocks < 32000 (PAR2 limit)
+        optimal_size = 256 * 1024 
+        calculated_blocks = file_size / optimal_size
+        
+        if calculated_blocks > 32768:
+            # File is huge, must increase block size to stay within count limit
+            target_block_size = int(math.ceil(file_size / 32768))
+        elif calculated_blocks < 2000:
+            # File is small, default behavior (2000 blocks) is fine, no flag needed
+            target_block_size = 0 
+        else:
+            # File is medium/large, force 256KB blocks
+            target_block_size = optimal_size
+            
+    cmd = [par2_path, "c", "-qq", f"-r{redundancy}"]
+    
+    if target_block_size > 0:
+        # Align to 4 bytes for safety
+        target_block_size = (target_block_size // 4) * 4
+        cmd.append(f"-s{target_block_size}")
+        logging.info(f"Forcing PAR2 block size to {target_block_size} bytes for improved granularity.")
+
+    cmd.extend([str(par2_base_path) + ".par2", str(payload_archive_path)])
+    
     if not run_command(cmd): logging.error("Failed to create PAR2 files."); return None
     logging.info("Generating file manifest...")
     files_to_encode, file_manifest = [], []
@@ -594,13 +651,21 @@ class FFmpegConsumerThread(threading.Thread):
         height = self.config["VIDEO_HEIGHT"]
         crf = self.config["X264_CRF"]
         fps = self.config["VIDEO_FPS"]
+        keyint = self.config.get("KEYINT_MAX", 1)
+        
+        # FIX: Explicitly enforce output resolution via filters.
+        # libx264 often enforces mod-16 dimensions by default if not told otherwise.
+        # We also enforce yuv420p for standard H.264 compatibility.
         self.ffmpeg_command_base = [
             self.config["FFMPEG_PATH"], '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
             '-s', f'{width}x{height}', '-pix_fmt', 'rgb24', '-r', str(fps), '-i', '-',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage',
-            '-keyint_min', '1',
+            '-g', str(keyint),
+            '-keyint_min', str(keyint),
             '-sc_threshold', '0',
             '-crf', str(crf),
+            '-vf', f'scale={width}:{height}', 
+            '-pix_fmt', 'yuv420p',
             '-movflags', '+faststart'
         ]
 
@@ -859,6 +924,9 @@ class DataWriterThread(threading.Thread):
         try:
             file_handles, current_file_idx, bytes_written_to_current_file = {}, 0, 0
             manifest_files = self.manifest['file_manifest_detailed']
+            # Optimization: Use a larger buffer size for file writing (1MB)
+            write_buffer_size = 1024 * 1024
+            
             while not self.stop_event.is_set():
                 data_bytes = self.data_queue.get()
                 if data_bytes is None: break
@@ -869,7 +937,7 @@ class DataWriterThread(threading.Thread):
                     file_path = self.output_dir / target_file['name']
                     if file_path not in file_handles:
                         file_path.parent.mkdir(parents=True, exist_ok=True)
-                        file_handles[file_path] = open(file_path, 'wb')
+                        file_handles[file_path] = open(file_path, 'wb', buffering=write_buffer_size)
                     bytes_remaining = target_file['size'] - bytes_written_to_current_file
                     chunk_size = min(bytes_remaining, len(data_bytes) - offset)
                     if chunk_size <= 0:
@@ -879,12 +947,23 @@ class DataWriterThread(threading.Thread):
                     offset += chunk_size
                     if bytes_written_to_current_file >= target_file['size']:
                         logging.info(f"Finished writing {file_path.name}")
-                        file_handles[file_path].close(); del file_handles[file_path]; current_file_idx += 1; bytes_written_to_current_file = 0
+                        file_handles[file_path].flush()
+                        os.fsync(file_handles[file_path].fileno())
+                        file_handles[file_path].close()
+                        del file_handles[file_path]
+                        current_file_idx += 1
+                        bytes_written_to_current_file = 0
         except Exception as e:
             logging.error(f"Error in DataWriterThread: {e}", exc_info=True)
         finally:
             for handle in file_handles.values():
-                if not handle.closed: handle.close()
+                if not handle.closed:
+                    try:
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    except OSError:
+                        pass
+                    handle.close()
             logging.info("DataWriterThread finished.")
     def stop(self): self.stop_event.set()
 
@@ -1265,9 +1344,12 @@ def decode_data_frames_gpu(
             end_idx = start_idx + total_encoded_bits_per_frame
             valid_bits_list.append(coded_bits[start_idx:end_idx])
         valid_bits = torch.cat(valid_bits_list)
-        if actual_bits != expected_bits:
-            discarded = actual_bits - expected_bits
-            logging.info(f"  Discarding {discarded} total padding bits ({discarded / num_frames:.1f} per frame)")
+        
+        # Log the per-frame padding removal
+        current_valid_bits = valid_bits.numel()
+        if actual_bits != current_valid_bits:
+            discarded = actual_bits - current_valid_bits
+            logging.info(f"  Discarding {discarded} per-frame padding bits ({discarded / num_frames:.1f} per frame)")
     
     if total_encoded_bits is not None and valid_bits.numel() > total_encoded_bits:
         delta = valid_bits.numel() - total_encoded_bits
@@ -1428,6 +1510,11 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         try:
             logging.info(f"DEBUG: Will extract data frames with indices {frame_idx_offset} to {frame_idx_offset + num_data_frames - 1}")
             for i in range(0, num_data_frames, batch_size):
+                # Safety check: if writer crashed, don't deadlock
+                if data_writer is not None and not data_writer.is_alive():
+                    logging.error("DataWriterThread died unexpectedly! Aborting decode.")
+                    break
+
                 start, end = i, min(i + batch_size, num_data_frames)
                 logging.info(f"Processing data frame batch: logical indices {start+frame_idx_offset} to {end+frame_idx_offset-1} (frame_num offsets: {start} to {end-1})...")
                 batch_count = end - start
@@ -1518,7 +1605,9 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         finally:
             data_queue.put(None)
             if data_writer is not None:
+                logging.info("Waiting for data writer thread to finish flushing all files to disk...")
                 data_writer.join()
+                logging.info("Data writer finished. Disk synchronization complete.")
 
         logging.info("--- DECODING SUMMARY (Data Frames) ---")
         logging.info(f"Total codewords with errors corrected: {total_corrected_data_codewords}")
@@ -1527,7 +1616,8 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         par2_path = config["PAR2_PATH"]
         main_par2_file = next(data_output_dir.glob("recovery_set.par2"), None)
         if main_par2_file:
-            run_command([par2_path, "r", "-a", main_par2_file.name], cwd=str(data_output_dir))
+            # Use stream_output=True for large files so PAR2 output isn't buffered in RAM
+            run_command([par2_path, "r", "-a", main_par2_file.name], cwd=str(data_output_dir), stream_output=True)
         
         sz_path = config["SEVENZIP_PATH"]
         archive_file = next(data_output_dir.glob("*.7z.001"), next(data_output_dir.glob("*_data_archive.7z"), None))
