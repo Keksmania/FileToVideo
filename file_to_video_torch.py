@@ -1,4 +1,4 @@
-# file_to_video_torch.py
+ # file_to_video_torch.py
 
 import argparse
 import getpass
@@ -363,65 +363,70 @@ def prepare_files_for_encoding(input_path: Path, temp_dir: Path, config: Dict, p
         cmd = [sz_path, "a", "-y", str(archive_path), str(input_path) + '/*']
         if not run_command(cmd): logging.error("Failed to archive directory."); return None
         file_to_compress = archive_path
-    logging.info("Compressing data payload with 7-Zip...")
-    payload_archive_path = temp_dir / f"{file_to_compress.stem}_data_archive.7z"
-    cmd = [sz_path, "a", "-y", str(payload_archive_path), str(file_to_compress)]
+    
+    logging.info("Compressing data payload with 7-Zip (splitting at 1GB)...")
+    payload_archive_base = temp_dir / f"{file_to_compress.stem}_data_archive.7z"
+    # -v1024m forces 7-Zip to split volumes at 1GB
+    cmd = [sz_path, "a", "-v1024m", "-y", str(payload_archive_base), str(file_to_compress)]
     if password: cmd.extend([f"-p{password}", "-mhe=on"])
     if not run_command(cmd): logging.error("Failed to compress data payload."); return None
     
-    logging.info("Creating PAR2 recovery files...")
-    par2_base_path = temp_dir / "recovery_set"
-    redundancy = config["PAR2_REDUNDANCY_PERCENT"]
-    
-    # --- BLOCK SIZE OPTIMIZATION ---
-    # For large files, the default 2000 blocks result in huge block sizes (e.g., 2.5MB for 5GB file).
-    # If the video has frequent noise (High CRF), a single bit error kills the whole 2.5MB block.
-    # We explicitly calculate a smaller block size (targeting ~256KB) to improve recovery granularity.
-    
-    archive_stat = payload_archive_path.stat()
-    file_size = archive_stat.st_size
-    target_block_size = 0
-    
-    # Check if user forced a specific size in config
-    if config.get("PAR2_BLOCK_SIZE_BYTES", 0) > 0:
-        target_block_size = int(config["PAR2_BLOCK_SIZE_BYTES"])
-        logging.info(f"Using configured PAR2 block size: {target_block_size} bytes")
-    else:
-        # Auto-calculate: Aim for ~256KB blocks, but keep total blocks < 32000 (PAR2 limit)
-        optimal_size = 256 * 1024 
-        calculated_blocks = file_size / optimal_size
-        
-        if calculated_blocks > 32768:
-            # File is huge, must increase block size to stay within count limit
-            target_block_size = int(math.ceil(file_size / 32768))
-        elif calculated_blocks < 2000:
-            # File is small, default behavior (2000 blocks) is fine, no flag needed
-            target_block_size = 0 
-        else:
-            # File is medium/large, force 256KB blocks
-            target_block_size = optimal_size
-            
-    cmd = [par2_path, "c", "-qq", f"-r{redundancy}"]
-    
-    if target_block_size > 0:
-        # Align to 4 bytes for safety
-        target_block_size = (target_block_size // 4) * 4
-        cmd.append(f"-s{target_block_size}")
-        logging.info(f"Forcing PAR2 block size to {target_block_size} bytes for improved granularity.")
+    # Identify all generated volumes (.7z.001, .002, etc.)
+    # Note: If size < 1GB, 7z still makes .001 if -v is used (usually), 
+    # or just .7z. We need to handle both.
+    archive_files = sorted(list(temp_dir.glob(f"{file_to_compress.stem}_data_archive.7z*")))
+    if not archive_files:
+        logging.error("Could not find generated archive files.")
+        return None
 
-    cmd.extend([str(par2_base_path) + ".par2", str(payload_archive_path)])
+    redundancy = config["PAR2_REDUNDANCY_PERCENT"]
+    # Fixed 256KB block size (256 * 1024)
+    block_size = 262144
+
+    logging.info(f"Creating PAR2 recovery files for {len(archive_files)} volume(s)...")
     
-    if not run_command(cmd): logging.error("Failed to create PAR2 files."); return None
+    for vol_file in archive_files:
+        # We only want to process the archives, not any pre-existing par2 files (though there shouldn't be any yet)
+        if vol_file.suffix == '.par2': continue
+
+        # Generate separate PAR2 sets for each volume
+        # Naming convention: volume.7z.001 -> volume.7z.001.par2
+        par2_base_name = vol_file.name + ".recovery"
+        par2_full_path = temp_dir / par2_base_name
+        
+        logging.info(f"  Generating PAR2 for volume: {vol_file.name} (Block size: 256KB)")
+        cmd = [
+            par2_path, "c", "-qq", 
+            f"-r{redundancy}", 
+            f"-s{block_size}", # Force 256KB blocks
+            str(par2_full_path) + ".par2", 
+            str(vol_file)
+        ]
+        if not run_command(cmd): 
+            logging.error(f"Failed to create PAR2 for {vol_file.name}"); 
+            return None
+
     logging.info("Generating file manifest...")
     files_to_encode, file_manifest = [], []
-    for f_path in sorted(temp_dir.glob("*")):
-        if f_path.is_file() and f_path.suffix in ['.7z', '.par2']:
-            if "data_archive.7z" in f_path.name: file_type = "sz_vol"
-            elif f_path.name.endswith(".par2") and ".vol" not in f_path.name: file_type = "par2_main"
-            elif ".vol" in f_path.name and f_path.name.endswith(".par2"): file_type = "par2_vol"
-            else: continue
+    
+    # Add files to encode list in a deterministic order
+    # We grab everything in temp_dir that looks like an archive part or a par2 file
+    all_files = sorted(temp_dir.glob("*"))
+    for f_path in all_files:
+        if f_path.is_file():
+            # Classify file types
+            if "data_archive.7z" in f_path.name and ".par2" not in f_path.name:
+                file_type = "sz_vol" # This covers .7z, .7z.001, .7z.002
+            elif f_path.name.endswith(".par2") and ".vol" not in f_path.name:
+                file_type = "par2_main"
+            elif ".vol" in f_path.name and f_path.name.endswith(".par2"):
+                file_type = "par2_vol"
+            else:
+                continue # Skip source files or others
+            
             files_to_encode.append(f_path)
             file_manifest.append({"name": f_path.name, "size": f_path.stat().st_size, "type": file_type})
+
     if not files_to_encode: logging.error("File preparation resulted in no files to encode."); return None
     logging.info(f"File preparation complete. {len(files_to_encode)} files generated.")
     return files_to_encode, {"file_manifest_detailed": file_manifest}
@@ -1614,19 +1619,38 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
 
         logging.info("Data reconstruction finished. Starting final recovery (par2/7z).")
         par2_path = config["PAR2_PATH"]
-        main_par2_file = next(data_output_dir.glob("recovery_set.par2"), None)
-        if main_par2_file:
-            # Use stream_output=True for large files so PAR2 output isn't buffered in RAM
-            run_command([par2_path, "r", "-a", main_par2_file.name], cwd=str(data_output_dir), stream_output=True)
-        
         sz_path = config["SEVENZIP_PATH"]
-        archive_file = next(data_output_dir.glob("*.7z.001"), next(data_output_dir.glob("*_data_archive.7z"), None))
-        if archive_file:
+        
+        # Iterate over all generated PAR2 index files.
+        # Naming convention was: filename.7z.001.recovery.par2
+        # We need to find all .par2 files that do NOT contain ".vol"
+        par2_indices = [f for f in data_output_dir.glob("*.par2") if ".vol" not in f.name]
+        
+        if not par2_indices:
+            logging.warning("No PAR2 index files found. Skipping recovery step.")
+        else:
+            for par2_file in sorted(par2_indices):
+                logging.info(f"Running PAR2 repair for volume set: {par2_file.name}")
+                # Use stream_output=True for large files so PAR2 output isn't buffered in RAM
+                run_command([par2_path, "r", "-a", par2_file.name], cwd=str(data_output_dir), stream_output=True)
+
+        # After repair, find the first 7z volume (usually ends in .001 or just .7z)
+        # We look for the base archive file
+        archive_candidates = list(data_output_dir.glob("*_data_archive.7z*"))
+        # We want the one that is either just .7z or .7z.001
+        main_archive = None
+        for cand in archive_candidates:
+            if cand.name.endswith(".7z") or cand.name.endswith(".001"):
+                main_archive = cand
+                break
+        
+        if main_archive:
             final_extraction_dir = output_dir / "Decoded_Files"
             final_extraction_dir.mkdir(exist_ok=True)
             current_password = password
             while True:
-                cmd = [sz_path, "x", "-y", f"-o{final_extraction_dir}", str(archive_file)]
+                # 7-Zip handles split volumes automatically if you point it to the first one (.001)
+                cmd = [sz_path, "x", "-y", f"-o{final_extraction_dir}", str(main_archive)]
                 if current_password:
                     cmd.insert(2, f"-p{current_password}")
                 if run_command(cmd, cwd=str(data_output_dir)):
@@ -1641,7 +1665,9 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
                 else:
                     logging.error("Extraction failed for a non-password protected archive.")
                     break
-        
+        else:
+            logging.error("Could not find the main archive file for extraction.")
+
         logging.info("Decoding process completed.")
         decode_elapsed = time.perf_counter() - decode_start
         logging.info(f"Decoding completed successfully in {decode_elapsed:.1f}s ({decode_elapsed/60:.2f} min).")
