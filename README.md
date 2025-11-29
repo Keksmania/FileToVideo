@@ -1,15 +1,17 @@
 # PythonFileToYoutube
 
-Turn any file or folder into one or more MP4 videos (and back again) using PyTorch-powered encoding, 7-Zip compression, PAR2 redundancy, and FFmpeg/x264. This repository contains the reference implementation plus tools for dependency checking and testing.
+Turn any file or folder into one or more MP4 videos (and back again) using PyTorch-powered encoding, 7-Zip compression, PAR2 redundancy, and FFmpeg/x264 (or NVENC). This repository contains the reference implementation plus tools for dependency checking and testing.
 
 ## Features
 
 - **End-to-end pipeline** – archive → error-correct → encode to frames → stream to FFmpeg, plus the reverse decode path.
 - **GPU-accelerated** – uses PyTorch to process large frame batches efficiently (CUDA strongly recommended).
-- **Segmented output** – automatically rotates MP4 files when they exceed the configured length (default ~11 hours at 60 fps).
-- **Robust metadata** – barcode + info frames describe payload size, frame counts, and optional password protection.
-- **Test suite** – run `python file_to_video_torch.py -test` to exercise Hamming codecs, frame round trips, and a miniature encode/decode flow.
-- **Cross-platform** – works on Windows and Linux as long as the external tools are installed.
+- **NVENC Support** – Optional hardware encoding for massive speed gains (see configuration).
+- **Asynchronous Processing** – Decoupled CPU unpacking and GPU encoding threads for maximum throughput and smooth resource usage.
+- **Robust Redundancy** – Splits large files into 1GB volumes and generates optimized 128KB PAR2 blocks for granular recovery.
+- **Segmented output** – Automatically rotates MP4 files when they exceed the configured length (default ~11 hours at 60fps).
+- **Robust metadata** – Barcode + info frames describe payload size, frame counts, and optional password protection.
+- **Cross-platform** – Works on Windows and Linux as long as the external tools are installed.
 
 ## Requirements
 
@@ -18,7 +20,7 @@ Turn any file or folder into one or more MP4 videos (and back again) using PyTor
 | Python | 3.11 (system install). Earlier versions are untested. |
 | PyTorch | GPU build (2.9.0+ with CUDA 13.x). Install from https://pytorch.org. |
 | CUDA | NVIDIA GPU drivers + CUDA toolkit matching your PyTorch build. `nvidia-smi` must work. |
-| FFmpeg | Must include `libx264` encoder. The default config invokes `ffmpeg` from PATH. |
+| FFmpeg | Must include `libx264` encoder. For GPU encoding, it must support `h264_nvenc`. |
 | 7-Zip CLI | `7z` binary (`p7zip-full` on Linux, official installer on Windows). |
 | PAR2 | `par2`/`par2cmdline` binary for creating redundancy blocks. |
 | Disk space | Enough to store the temp archive, PAR2 set, intermediate frames, and final MP4(s). |
@@ -37,38 +39,27 @@ Each script lists missing dependencies and suggests installation steps (includin
    git clone https://github.com/Keksmania/PythonFileToYoutube.git
    cd PythonFileToYoutube
    ```
-2. **Install Python dependencies** – the project relies solely on the standard library and PyTorch (installed globally via the PyTorch instructions).
+2. **Install Python dependencies** – the project relies solely on the standard library, `numpy` and `torch`.
 3. **Install external tools** – ensure `ffmpeg`, `7z`, and `par2` commands are on your PATH.
-4. **Configure** – edit `f2yt_config.json` if you need custom paths or encoding settings. Defaults assume 720×720 video, 60 fps, and RGB data frames.
+4. **Configure** – edit `f2yt_config.json` if you need custom paths or encoding settings. Defaults assume 720x720 video, 60fps, and RGB data frames.
 5. **Verify environment** – run the OS-appropriate dependency script listed above.
 
 ## Usage
 
 ### Encoding
 ```powershell
-python file_to_video_torch.py -mode encode -input C:\path\to\file_or_folder -output C:\path\to\output_dir [-p password]
+python file_to_video_torch.py -mode encode -input "C:\path\to\file_or_folder" [-output "C:\path\to\output_dir"] [-p password]
 ```
-- The output directory will gain `*_F2YT.mp4` (or segmented `_part###.mp4`) files plus temporary working folders.
+- The output directory will contain `*_F2YT.mp4` (or segmented `_part###.mp4`) files.
 - Set `-p` to password-protect the 7z archive (`-mhe=on`), which keeps filenames encrypted.
 
 ### Decoding
 ```powershell
-python file_to_video_torch.py -mode decode -input "video.mp4[,video_part002.mp4,...]" -output C:\path\to\restore [-p password]
+python file_to_video_torch.py -mode decode -input "video_part001.mp4,video_part002.mp4" [-output "C:\path\to\restore"] [-p password]
 ```
-- You may provide a comma-separated list if the payload spans multiple segments.
+- You **must** provide a comma-separated list of all segment files if the payload spans multiple videos.
+- If no output directory is specified, it defaults to `_F2YT_Output` next to the first input file.
 - Decoded files end up in `<output>/Decoded_Files` once 7-Zip and PAR2 complete.
-
-### Running the Test Suite
-```powershell
-python file_to_video_torch.py -test
-```
-The suite validates:
-- Hamming(7,4) codec integrity.
-- Pixel conversion round trips for info/data frames.
-- Info block encode/decode consistency.
-- Data frame encode/decode at 32×32.
-- Large (100 KB) stress test.
-- Password-protected encode/decode flow.
 
 ## Configuration Reference (`f2yt_config.json`)
 
@@ -77,37 +68,40 @@ The suite validates:
 | `FFMPEG_PATH` | Path to the FFmpeg binary. |
 | `SEVENZIP_PATH` | Path to the 7-Zip CLI (`7z`). |
 | `PAR2_PATH` | Path to the PAR2 executable. |
-| `VIDEO_WIDTH`/`VIDEO_HEIGHT` | Output resolution (default 720×720). |
+| `VIDEO_WIDTH`/`VIDEO_HEIGHT` | Output resolution (default 720x720). |
 | `VIDEO_FPS` | Frames per second (default 60). |
-| `DATA_K_SIDE` | Data frame size (default 180). |
+| `DATA_K_SIDE` | Data frame size (default 180). Must scale cleanly into video resolution (e.g., 720/180 = 4). |
 | `NUM_COLORS_DATA` | Palette size (power of two). |
 | `PAR2_REDUNDANCY_PERCENT` | PAR2 redundancy percentage. |
-| `X264_CRF` | Quality parameter for x264 (lower = larger files). |
+| `X264_CRF` | Quality parameter for x264/NVENC (lower = larger files/better quality). |
+| `ENABLE_NVENC` | Set to `true` to use GPU hardware encoding (faster, but larger files). |
 | `CPU_PRODUCER_CHUNK_MB` | File chunk size for the producer thread. |
 | `GPU_PROCESSOR_BATCH_SIZE` | Number of frames processed per GPU batch. |
+| `GPU_OVERLAP_STREAMS` | Number of CUDA streams for async processing. |
+| `PIPELINE_QUEUE_DEPTH` | Buffer size for thread queues to smooth workload spikes. |
 | `MAX_VIDEO_SEGMENT_HOURS` | Approx hours per MP4 before rolling to a new segment (default 11). |
-| `MAX_VIDEO_SEGMENT_FRAMES_OVERRIDE` | Optional explicit frame cap for testing segmentation. |
 
 ## Workflow Overview
 
-1. `prepare_files_for_encoding` compresses the payload with 7-Zip and creates PAR2 files.
-2. Info frames + barcode encode session metadata (JSON) using Hamming(7,4).
-3. `DataProducerThread` streams payload bits to `encode_data_frames_gpu`, which packs them into RGB tiles.
-4. `FFmpegConsumerThread` pipes the RGB stream into `ffmpeg -f rawvideo ... -c:v libx264` to produce MP4 segments.
-5. Decoding runs the inverse steps, reconstructing files and verifying hash sizes via the manifest.
+1. **Preparation**: `prepare_files_for_encoding` compresses the payload with 7-Zip. It enforces a **1GB volume split** and generates **128KB-block PAR2** files for each volume to ensure recovery works even on large datasets with heavy video compression.
+2. **Metadata**: Info frames + barcode encode session metadata (JSON) using Hamming(7,4).
+3. **Async Encoding**: `DataProducerThread` reads raw bytes and unpacks them asynchronously on the CPU.
+4. **GPU Packing**: `encode_data_frames_gpu` packs unpacked bits into RGB tiles on the GPU using CUDA.
+5. **Video Stream**: `FFmpegConsumerThread` pipes the RGB stream into `ffmpeg` (via CPU `libx264` or GPU `h264_nvenc`) to produce MP4 segments.
+6. **Decoding**: Runs the inverse steps: `FrameProducerThread` fetches frames -> GPU Decodes -> `DataWriterThread` writes to disk -> PAR2 Repairs -> 7-Zip Extracts.
 
 ## Troubleshooting
 
-- **Dependency missing** – run the OS-specific dependency script; install any reported tool and rerun.
-- **CUDA unavailable** – confirm `nvidia-smi` works and that your PyTorch build reports `torch.cuda.is_available() == True`.
-- **FFmpeg errors** – inspect the log output (already printed). Ensure your `ffmpeg` build supports `libx264`.
-- **Decode issues** – verify that the info frame count matches (watch for warnings) and that you supply all segment files in order.
+- **Dependency missing** – Run the OS-specific dependency script; install any reported tool and rerun.
+- **CUDA unavailable** – Confirm `nvidia-smi` works and that your PyTorch build reports `torch.cuda.is_available() == True`.
+- **FFmpeg errors** – Inspect the log output. Ensure your `ffmpeg` build supports `libx264` (or `h264_nvenc` if enabled).
+- **Decode issues** – Verify that the info frame count matches (watch for warnings) and that you supply **all** segment files in the correct order.
+- **Output Resolution** – The script forces strict resolution scaling filters to avoid "mod-16" cropping issues. Ensure `VIDEO_WIDTH` is divisible by `DATA_K_SIDE`.
 
 ## Contributing
 
 Issues and PRs are welcome! Please include:
 - A description of the problem / feature.
-- Steps to reproduce (or new tests).
 - Hardware/OS details, especially GPU and CUDA versions.
 
 ## License
