@@ -182,9 +182,10 @@ def run_command(command: List[str], cwd: Optional[str] = None, stream_output: bo
     logging.info(f"Running command: {shlex.join(command)}")
     try:
         if stream_output:
-            process = subprocess.run(command, check=False, cwd=cwd, text=True)
+            process = subprocess.run(command, check=False, cwd=cwd, text=True, input="")
         else:
-            process = subprocess.run(command, capture_output=True, text=True, check=False, cwd=cwd)
+            # input="" prevents tools like 7z from hanging on stdin prompts if arguments are wrong
+            process = subprocess.run(command, capture_output=True, text=True, check=False, cwd=cwd, input="")
         
         if not stream_output:
             if process.stdout: logging.info(f"STDOUT:\n{process.stdout.strip()}")
@@ -1454,6 +1455,8 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
     logging.info(f"Starting decoding for '{input_path_str}'...")
     temp_dir = output_dir / TEMP_DECODE_DIR; temp_dir.mkdir(exist_ok=True)
     data_writer: Optional[DataWriterThread] = None
+    should_cleanup = True # Default to cleanup
+
     try:
         raw_inputs = [segment.strip() for segment in input_path_str.split(',') if segment.strip()]
         if not raw_inputs:
@@ -1718,8 +1721,6 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         sz_path = config["SEVENZIP_PATH"]
         
         # Iterate over all generated PAR2 index files.
-        # Naming convention was: filename.7z.001.recovery.par2
-        # We need to find all .par2 files that do NOT contain ".vol"
         par2_indices = [f for f in data_output_dir.glob("*.par2") if ".vol" not in f.name]
         
         if not par2_indices:
@@ -1727,13 +1728,10 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         else:
             for par2_file in sorted(par2_indices):
                 logging.info(f"Running PAR2 repair for volume set: {par2_file.name}")
-                # Use stream_output=True for large files so PAR2 output isn't buffered in RAM
                 run_command([par2_path, "r", "-a", par2_file.name], cwd=str(data_output_dir), stream_output=True)
 
-        # After repair, find the first 7z volume (usually ends in .001 or just .7z)
-        # We look for the base archive file
+        # After repair, find the first 7z volume
         archive_candidates = list(data_output_dir.glob("*_data_archive.7z*"))
-        # We want the one that is either just .7z or .7z.001
         main_archive = None
         for cand in archive_candidates:
             if cand.name.endswith(".7z") or cand.name.endswith(".001"):
@@ -1745,18 +1743,33 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
             final_extraction_dir.mkdir(exist_ok=True)
             current_password = password
             while True:
-                # 7-Zip handles split volumes automatically if you point it to the first one (.001)
                 cmd = [sz_path, "x", "-y", f"-o{final_extraction_dir}", str(main_archive)]
                 if current_password:
                     cmd.insert(2, f"-p{current_password}")
+                
                 if run_command(cmd, cwd=str(data_output_dir)):
                     logging.info(f"Extraction successful. Files are in '{final_extraction_dir}'")
                     break
+                
+                # Handle failure (wrong password, etc.)
                 if session_params.get("is_password_protected"):
-                    logging.warning("Extraction failed, likely due to incorrect password.")
-                    current_password = getpass.getpass("Please enter the correct password (or press Enter to skip): ")
-                    if not current_password:
-                        logging.warning("Skipping final extraction.")
+                    logging.warning("Extraction failed. The password provided might be incorrect.")
+                    print("\nOptions:")
+                    print("  [r] Retry with a different password")
+                    print("  [c] Cancel and CLEANUP temporary files")
+                    print("  [k] Cancel and KEEP temporary files (for manual recovery)")
+                    
+                    choice = input("Select option (r/c/k): ").strip().lower()
+                    
+                    if choice == 'r':
+                        current_password = getpass.getpass("Enter password: ")
+                        continue # Loop again to retry
+                    elif choice == 'k':
+                        logging.warning("User cancelled extraction. Keeping temporary files.")
+                        should_cleanup = False
+                        break
+                    else: # Default to cleanup (c)
+                        logging.warning("User cancelled extraction. Cleaning up.")
                         break
                 else:
                     logging.error("Extraction failed for a non-password protected archive.")
@@ -1768,7 +1781,10 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         decode_elapsed = time.perf_counter() - decode_start
         logging.info(f"Decoding completed successfully in {decode_elapsed:.1f}s ({decode_elapsed/60:.2f} min).")
     finally:
-        cleanup_temp_dir(temp_dir, "decoding temp")
+        if should_cleanup:
+            cleanup_temp_dir(temp_dir, "decoding temp")
+        else:
+            logging.info(f"Temporary decoding files preserved at: {temp_dir}")
 
 # --- Main Entry Point ---
 
