@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -172,6 +173,14 @@ def pin_tensor_if_possible(tensor: torch.Tensor) -> torch.Tensor:
     except RuntimeError:
         logging.debug("pin_memory not supported for this tensor; continuing without pinning.")
         return tensor
+
+def sanitize_filename(name: str) -> str:
+    """
+    Removes any characters from the filename that aren't alphanumeric, 
+    dots, underscores, or hyphens to ensure tool compatibility.
+    """
+    # Keep only a-z, A-Z, 0-9, ., _, -
+    return re.sub(r'[^a-zA-Z0-9\._-]', '', name)
 
 # --- Core Utility Functions ---
 
@@ -357,16 +366,21 @@ def prepare_files_for_encoding(input_path: Path, temp_dir: Path, config: Dict, p
     file_to_compress = input_path
     
     logging.info(f"Compressing data payload from '{input_path}' with 7-Zip (splitting at 1GB)...")
-    payload_archive_base = temp_dir / f"{input_path.stem}_data_archive.7z"
+    
+    # that confuse PAR2/globbing tools for new files.
+    safe_stem = sanitize_filename(file_to_compress.stem)
+    if not safe_stem: safe_stem = "payload"
+    
+    payload_archive_base = temp_dir / f"{safe_stem}_data_archive.7z"
     
     # -v1024m forces 7-Zip to split volumes at 1GB
-    cmd = [sz_path, "a", "-v1024m", "-y", str(payload_archive_base), str(input_path)]
+    cmd = [sz_path, "a", "-v1024m", "-y", str(payload_archive_base), str(file_to_compress)]
     if password: cmd.extend([f"-p{password}", "-mhe=on"])
     
     if not run_command(cmd): logging.error("Failed to compress data payload."); return None
     
-    # Identify all generated volumes via directory listing to avoid glob special char issues
-    prefix = f"{input_path.stem}_data_archive.7z"
+    # Identify all generated volumes via directory listing
+    prefix = f"{safe_stem}_data_archive.7z"
     archive_files = sorted([f for f in temp_dir.iterdir() if f.name.startswith(prefix)])
     
     if not archive_files:
@@ -384,62 +398,26 @@ def prepare_files_for_encoding(input_path: Path, temp_dir: Path, config: Dict, p
         par2_base_name = vol_file.name + ".recovery"
         par2_full_path = temp_dir / par2_base_name
         
-        # FIX: Rename inputs to safe alphanumeric names for PAR2 creation to avoid CLI issues
-        safe_par2_name = "temp_create.par2"
-        safe_vol_name = "temp_source.bin"
         
-        safe_par2_path = temp_dir / safe_par2_name
-        safe_vol_path = temp_dir / safe_vol_name
-        
-        try:
-            # Rename source volume temporarily
-            vol_file.rename(safe_vol_path)
-            
-            logging.info(f"  Generating PAR2 for volume: {vol_file.name} (Block size: 256KB)")
-            cmd = [
-                par2_path, "c", "-qq", 
-                f"-r{redundancy}", 
-                f"-s{block_size}", 
-                str(safe_par2_path), 
-                str(safe_vol_path)
-            ]
-            
-            if not run_command(cmd): 
-                logging.error(f"Failed to create PAR2 for {vol_file.name}"); 
-                # Restore name before returning
-                safe_vol_path.rename(vol_file)
-                return None
-            
-            # Restore volume name
-            safe_vol_path.rename(vol_file)
-            
-            # Rename generated PAR2 files to correct final names
-            if safe_par2_path.exists():
-                final_path = str(par2_full_path) + ".par2"
-                shutil.move(str(safe_par2_path), final_path)
-                
-                # Also rename the .vol files (par2 creates name.vol00+01.par2)
-                for generated in temp_dir.glob(f"{safe_par2_name}*"):
-                    # We need to replace "temp_create.par2" with "RealName.recovery.par2" in the filename
-                    # But wait, the PAR2 file internally references "temp_source.bin".
-                    # This is fine for transmission, but during decoding we will need to do the reverse rename dance.
-                    
-                    new_name = generated.name.replace(safe_par2_name, par2_base_name + ".par2")
-                    new_name = new_name.replace(".par2.vol", ".vol")
-                    shutil.move(str(generated), str(temp_dir / new_name))
-
-        except Exception as e:
-            logging.error(f"Error during PAR2 creation: {e}")
-            # Attempt cleanup/restore
-            if safe_vol_path.exists(): safe_vol_path.rename(vol_file)
+        logging.info(f"  Generating PAR2 for volume: {vol_file.name} (Block size: 256KB)")
+        cmd = [
+            par2_path, "c", "-qq", 
+            f"-r{redundancy}", 
+            f"-s{block_size}", 
+            str(par2_full_path) + ".par2", 
+            str(vol_file)
+        ]
+        if not run_command(cmd): 
+            logging.error(f"Failed to create PAR2 for {vol_file.name}"); 
             return None
 
     logging.info("Generating file manifest...")
     files_to_encode, file_manifest = [], []
     
-    # Re-scan temp_dir for all relevant files
+    # Re-scan temp_dir for all relevant files to encode (archives + par2s)
     all_files = sorted([f for f in temp_dir.iterdir() if f.is_file()])
     for f_path in all_files:
+        # Match sanitized names
         if "data_archive.7z" in f_path.name and ".par2" not in f_path.name:
             file_type = "sz_vol" 
         elif f_path.name.endswith(".par2") and ".vol" not in f_path.name:
@@ -1054,8 +1032,13 @@ class DataWriterThread(threading.Thread):
             write_buffer_size = 1024 * 1024
             
             while not self.stop_event.is_set():
-                data_bytes = self.data_queue.get()
-                if data_bytes is None: break
+                try:
+                    # Non-blocking get with short timeout to check stop_event frequently
+                    data_bytes = self.data_queue.get(timeout=0.5)
+                    if data_bytes is None: break
+                except queue.Empty:
+                    continue
+
                 offset = 0
                 while offset < len(data_bytes):
                     if current_file_idx >= len(manifest_files): break
@@ -1094,11 +1077,7 @@ class DataWriterThread(threading.Thread):
     def stop(self): self.stop_event.set()
 
 def extract_frame_as_tensor(video_path: Path, frame_index: int, temp_dir: Path, config: Dict, frame_type: str = 'data') -> Optional[torch.Tensor]:
-    """Extract a specific frame from video using frame-accurate seeking.
-    
-    frame_type: 'barcode' (720x720), 'info' (16x16), or 'data' (180x180)
-    Extracts at the appropriate resolution for each frame type to preserve color precision.
-    """
+    """Extract a specific frame from video using frame-accurate seeking."""
     ffmpeg_path = config["FFMPEG_PATH"]
     fps = config.get("VIDEO_FPS", 60)
     
@@ -1748,11 +1727,19 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         except KeyboardInterrupt:
             logging.warning("Keyboard interrupt during data decoding.")
         finally:
+            # Ensure we send the shutdown signal to the writer thread
             data_queue.put(None)
             if data_writer is not None:
                 logging.info("Waiting for data writer thread to finish flushing all files to disk...")
-                data_writer.join()
-                logging.info("Data writer finished. Disk synchronization complete.")
+                try:
+                    # Give it a reasonable timeout, don't block forever if it's truly stuck
+                    data_writer.join(timeout=60) 
+                    if data_writer.is_alive():
+                         logging.error("Data writer thread is stuck and failed to join gracefully.")
+                    else:
+                         logging.info("Data writer finished. Disk synchronization complete.")
+                except RuntimeError:
+                    pass
 
         logging.info("--- DECODING SUMMARY (Data Frames) ---")
         logging.info(f"Total codewords with errors corrected: {total_corrected_data_codewords}")
@@ -1768,66 +1755,17 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
             logging.warning("No PAR2 index files found. Skipping recovery step.")
         else:
             for par2_path_obj in sorted(par2_indices):
-                # FIX: Rename complicated filename to safe temp name for PAR2 execution
-                temp_safe_name = "temp_repair_index.par2"
-                temp_safe_path = data_output_dir / temp_safe_name
-                
-                # 1. Identify the data file
-                # par2_path_obj is like "ComplexName.7z.001.recovery.par2"
-                # data_file_name should be "ComplexName.7z.001"
-                data_file_name = par2_path_obj.name.replace(".recovery.par2", "")
-                data_file_path = data_output_dir / data_file_name
-
-                # 2. Define safe names
-                safe_data_name = "temp_safe_data.bin"
-                safe_data_path = data_output_dir / safe_data_name
-
-                renamed_data = False
-                renamed_par2 = False
-                
-                try:
-                    # Rename Data File
-                    if data_file_path.exists():
-                         data_file_path.rename(safe_data_path)
-                         renamed_data = True
-                         logging.info(f"Renamed data file {data_file_name} -> {safe_data_name}")
-
-                    # Rename PAR2 File
-                    par2_path_obj.rename(temp_safe_path)
-                    renamed_par2 = True
-                    logging.info(f"Renamed par2 file {par2_path_obj.name} -> {temp_safe_name}")
-                    
-                    logging.info(f"Running PAR2 repair...")
-                    # Run command on the safe names, explicitly passing the data file as argument
-                    if renamed_data:
-                         cmd = [par2_path, "r", "-a", temp_safe_name, safe_data_name]
-                    else:
-                         cmd = [par2_path, "r", "-a", temp_safe_name]
-
-                    run_command(cmd, cwd=str(data_output_dir), stream_output=True)
-
-                except Exception as e:
-                    logging.error(f"Failed during PAR2 rename/execution: {e}")
-                finally:
-                    # Always try to rename back to keep state consistent for user/debugging
-                    if renamed_par2 and temp_safe_path.exists():
-                        try:
-                            temp_safe_path.rename(par2_path_obj)
-                            logging.info("Restored original PAR2 filename.")
-                        except OSError:
-                            logging.warning("Could not restore original PAR2 filename.")
-                    
-                    if renamed_data and safe_data_path.exists():
-                        try:
-                            safe_data_path.rename(data_file_path)
-                            logging.info("Restored original Data filename.")
-                        except OSError:
-                            logging.warning("Could not restore original Data filename.")
+                # Simple PAR2 call without renaming tricks
+                # We rely on the fact that NEW files are sanitized. 
+                # OLD unsanitized files will just fail to repair here but won't crash the script.
+                logging.info(f"Running PAR2 repair for volume set: {par2_path_obj.name}")
+                run_command([par2_path, "r", "-a", par2_path_obj.name], cwd=str(data_output_dir), stream_output=True)
 
         # After repair, find the first 7z volume
         archive_candidates = list(data_output_dir.glob("*_data_archive.7z*"))
         main_archive = None
         for cand in archive_candidates:
+            # Look for .001 or just .7z
             if cand.name.endswith(".7z") or cand.name.endswith(".001"):
                 main_archive = cand
                 break
