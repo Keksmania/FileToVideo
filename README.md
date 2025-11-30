@@ -1,6 +1,8 @@
 # PythonFileToYoutube
 
-Turn any file or folder into one or more MP4 videos (and back again) using PyTorch-powered encoding, 7-Zip compression, PAR2 redundancy, and FFmpeg/x264 (or NVENC). This repository contains the reference implementation plus tools for dependency checking and testing.
+Turn any file or folder into one or more MP4 videos (and back again) using PyTorch, 7-Zip, PAR2, FFmpeg
+The script is optimized for youtube. Meaning the default config is good enough that a file should be able to survice a full round trip to youtube and back. 
+
 
 ## Features
 
@@ -51,7 +53,7 @@ Each script lists missing dependencies and suggests installation steps (includin
 python file_to_video_torch.py -mode encode -input "C:\path\to\file_or_folder" [-output "C:\path\to\output_dir"] [-p password]
 ```
 - The output directory will contain `*_F2YT.mp4` (or segmented `_part###.mp4`) files.
-- Set `-p` to password-protect the 7z archive (`-mhe=on`), which keeps filenames encrypted.
+- Set `-p` to password-protect the 7z archive.
 
 ### Decoding
 ```powershell
