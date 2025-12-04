@@ -87,20 +87,28 @@ def setup_pytorch() -> torch.device:
 def load_config() -> Dict[str, Any]:
     script_dir = Path(__file__).resolve().parent
     config_path = script_dir / CONFIG_FILENAME
+    
     default_config = {
-        "FFMPEG_PATH": "ffmpeg", "SEVENZIP_PATH": "7z", "PAR2_PATH": "par2",
-        "VIDEO_WIDTH": 720, "VIDEO_HEIGHT": 720, "VIDEO_FPS": 60,
-        "DATA_K_SIDE": 180, "NUM_COLORS_DATA": 2,
-        "PAR2_REDUNDANCY_PERCENT": 5, "X264_CRF": 30,
+        "FFMPEG_PATH": "ffmpeg", 
+        "SEVENZIP_PATH": "7z", 
+        "PAR2_PATH": "par2",
+        "VIDEO_WIDTH": 720, 
+        "VIDEO_HEIGHT": 720,
+        "DATA_K_SIDE": 180, 
+        "NUM_COLORS_DATA": 2,
+        "PAR2_REDUNDANCY_PERCENT": 5, 
+        "X264_CRF": 30,
         "KEYINT_MAX": 1,
-        "CPU_PRODUCER_CHUNK_MB": 128, 
-        "GPU_PROCESSOR_BATCH_SIZE": 512,
         "MAX_VIDEO_SEGMENT_HOURS": 11,
+        "CPU_PRODUCER_CHUNK_MB": 256,
+        "GPU_PROCESSOR_BATCH_SIZE": 512,
         "GPU_OVERLAP_STREAMS": 8,
-        "PIPELINE_QUEUE_DEPTH": 64, 
+        "PIPELINE_QUEUE_DEPTH": 64,
         "CPU_WORKER_THREADS": 2,
-        "ENABLE_NVENC": True
+        "ENABLE_NVENC": True,
+        "VIDEO_FPS": 60 
     }
+    
     if not config_path.exists():
         logging.info(f"Config file not found. Creating default at '{config_path}'")
         try:
@@ -125,7 +133,6 @@ def capture_decode_config_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
     for key in DECODE_CONFIG_EXPORT_KEYS:
         if key in config and config[key] is not None:
             snapshot[key] = config[key]
-    # Include informational constants for completeness/debugging
     snapshot["INFO_K_SIDE"] = INFO_K_SIDE
     snapshot["INFO_BITS_PER_PALETTE_COLOR"] = INFO_BITS_PER_PALETTE_COLOR
     snapshot["DATA_HAMMING_K"] = DATA_HAMMING_K
@@ -179,7 +186,6 @@ def sanitize_filename(name: str) -> str:
     Removes any characters from the filename that aren't alphanumeric, 
     dots, underscores, or hyphens to ensure tool compatibility.
     """
-    # Keep only a-z, A-Z, 0-9, ., _, -
     return re.sub(r'[^a-zA-Z0-9\._-]', '', name)
 
 # --- UI Helper Classes ---
@@ -206,7 +212,6 @@ class ConsoleProgressBar(threading.Thread):
         while not self.stop_event.is_set():
             self._print_bar()
             time.sleep(0.1)
-        # Print 100% state
         self._print_bar()
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -242,7 +247,6 @@ def run_command(command: List[str], cwd: Optional[str] = None, stream_output: bo
     """
     logging.info(f"Running command: {shlex.join(command)}")
     try:
-        # input="" prevents tools like 7z from hanging on stdin prompts if arguments are wrong
         if stream_output:
             process = subprocess.run(command, check=False, cwd=cwd, text=True, input="")
         else:
@@ -296,7 +300,6 @@ def bit_chunks_to_frame_batch(
     palette: torch.Tensor,
     bits_per_color: int
 ) -> torch.Tensor:
-    """Convert encoded bit chunks for many frames into actual RGB tensors in one shot."""
     if frame_bit_chunks.numel() == 0:
         return torch.empty(0, k_side, k_side, palette.shape[1], dtype=torch.uint8, device=frame_bit_chunks.device)
 
@@ -426,8 +429,8 @@ def prepare_files_for_encoding(input_path: Path, temp_dir: Path, config: Dict, p
         return None
 
     redundancy = config["PAR2_REDUNDANCY_PERCENT"]
-    # Fixed 128KB block size (128 * 1024)
-    block_size = 131072
+    # Updated block size
+    block_size = 131072 # 128KB
 
     logging.info(f"Creating PAR2 recovery files for {len(archive_files)} volume(s)...")
     
@@ -436,7 +439,7 @@ def prepare_files_for_encoding(input_path: Path, temp_dir: Path, config: Dict, p
         par2_base_name = vol_file.name + ".recovery"
         par2_full_path = temp_dir / par2_base_name
         
-        logging.info(f"  Generating PAR2 for volume: {vol_file.name} (Block size: 256KB)")
+        logging.info(f"  Generating PAR2 for volume: {vol_file.name} (Block size: 128KB)")
         cmd = [
             par2_path, "c", "-qq", 
             f"-r{redundancy}", 
@@ -1115,18 +1118,14 @@ def extract_frame_as_tensor(video_path: Path, frame_index: int, temp_dir: Path, 
     ffmpeg_path = config["FFMPEG_PATH"]
     fps = config.get("VIDEO_FPS", 60)
     
-    # Determine extraction resolution based on frame type
     if frame_type == 'barcode':
-        extract_size = 720  # Barcode needs full width
+        extract_size = 720
     elif frame_type == 'info':
-        extract_size = INFO_K_SIDE  # 16x16 for info frames
-    else:  # 'data'
+        extract_size = INFO_K_SIDE
+    else:
         extract_size = config.get("DATA_K_SIDE", 180)
     
-    # Calculate timestamp from frame index
     timestamp = frame_index / fps
-    
-    # Extract at appropriate size to avoid upscaling/downscaling precision loss
     command = [
         ffmpeg_path, '-hide_banner', '-loglevel', 'error',
         '-accurate_seek',
@@ -1139,9 +1138,6 @@ def extract_frame_as_tensor(video_path: Path, frame_index: int, temp_dir: Path, 
     ]
     try:
         proc = subprocess.run(command, capture_output=True, check=True, timeout=10)
-        if proc.stdout is None or len(proc.stdout) == 0:
-            logging.error(f"FFmpeg extracted empty stdout for frame {frame_index}.")
-            return None
         img_bytes = proc.stdout
         with Image.open(io.BytesIO(img_bytes)) as img:
             img_rgb = img.convert('RGB')
@@ -1149,169 +1145,143 @@ def extract_frame_as_tensor(video_path: Path, frame_index: int, temp_dir: Path, 
             if np_frame.shape[:2] != (extract_size, extract_size):
                 np_frame = np.array(Image.fromarray(np_frame).resize((extract_size, extract_size), Image.Resampling.NEAREST))
         return torch.from_numpy(np_frame)
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Failed to extract frame {frame_index}. FFmpeg stderr:\n{e.stderr.decode('utf-8', 'ignore') if e.stderr else 'no stderr'}")
-        return None
-    except subprocess.TimeoutExpired:
-        logging.error(f"FFmpeg frame extraction timed out for frame {frame_index}.")
-        return None
     except Exception as e:
-        logging.error(f"An error occurred loading extracted frame {frame_index}: {e}")
+        logging.error(f"Failed to extract frame {frame_index}: {e}")
         return None
 
 def extract_frames_batch(video_path: Path, start_frame_index: int, frame_count: int, config: Dict, frame_type: str = 'data') -> Optional[torch.Tensor]:
-    """Extract a contiguous batch of frames of the requested type in one ffmpeg invocation."""
-    if frame_count <= 0:
-        return None
-
+    """Extract a batch using seeking. Only used for Info/Barcode or single-file fallback."""
+    if frame_count <= 0: return None
     ffmpeg_path = config["FFMPEG_PATH"]
     fps = config.get("VIDEO_FPS", 60)
-    if frame_type == 'info':
-        extract_size = INFO_K_SIDE
-    elif frame_type == 'barcode':
-        extract_size = max(config.get("VIDEO_WIDTH", 720), config.get("VIDEO_HEIGHT", 720))
-    else:
-        extract_size = config.get("DATA_K_SIDE", 180)
-
+    extract_size = config.get("DATA_K_SIDE", 180) if frame_type == 'data' else (INFO_K_SIDE if frame_type == 'info' else 720)
     timestamp = start_frame_index / fps
-    scale_filter = (
-        f"scale={extract_size}:{extract_size}:flags=neighbor:force_original_aspect_ratio=decrease,"
-        f"pad={extract_size}:{extract_size}:(ow-iw)/2:(oh-ih)/2"
-    )
+    scale_filter = f"scale={extract_size}:{extract_size}:flags=neighbor:force_original_aspect_ratio=decrease,pad={extract_size}:{extract_size}:(ow-iw)/2:(oh-ih)/2"
     command = [
-        ffmpeg_path,
-        '-hide_banner', '-loglevel', 'error',
-        '-accurate_seek', '-seek_timestamp', '1',
-        '-ss', f'{timestamp:.6f}',
-        '-i', str(video_path),
-        '-vframes', str(frame_count),
-        '-vf', scale_filter,
-        '-pix_fmt', 'rgb24',
-        '-vsync', '0',
-        '-f', 'rawvideo',
-        '-'
+        ffmpeg_path, '-hide_banner', '-loglevel', 'error', '-accurate_seek', '-seek_timestamp', '1',
+        '-ss', f'{timestamp:.6f}', '-i', str(video_path), '-vframes', str(frame_count),
+        '-vf', scale_filter, '-pix_fmt', 'rgb24', '-vsync', '0', '-f', 'rawvideo', '-'
     ]
-
     try:
         proc = subprocess.run(command, check=True, capture_output=True)
-    except subprocess.CalledProcessError as e:
-        logging.error(
-            "Batched ffmpeg extraction failed for frames %d-%d (%s). stderr=%s",
-            start_frame_index,
-            start_frame_index + frame_count - 1,
-            frame_type,
-            e.stderr.decode('utf-8', 'ignore') if e.stderr else 'no stderr'
-        )
-        return None
-    except Exception as e:
-        logging.error(f"Unexpected error while extracting frame batch starting at {start_frame_index} ({frame_type}): {e}")
+        raw = proc.stdout
+        if not raw: return None
+        bytes_per_frame = extract_size * extract_size * 3
+        actual_frames = len(raw) // bytes_per_frame
+        if actual_frames == 0: return None
+        return torch.from_numpy(np.frombuffer(raw[:actual_frames*bytes_per_frame], dtype=np.uint8).copy()).view(actual_frames, extract_size, extract_size, 3).to(torch.uint8)
+    except Exception:
         return None
 
-    raw = proc.stdout
-    if not raw:
-        logging.error("FFmpeg returned no pixel data for frames %d-%d (%s)", start_frame_index, start_frame_index + frame_count - 1, frame_type)
-        return None
-
-    bytes_per_frame = extract_size * extract_size * 3
-    total_bytes = len(raw)
-    actual_frames = total_bytes // bytes_per_frame
-    if actual_frames == 0:
-        logging.error("FFmpeg output (%d bytes) too small for even a single %dx%dx4 frame (%s)", total_bytes, extract_size, extract_size, frame_type)
-        return None
-    if actual_frames < frame_count:
-        logging.warning(
-            "Requested %d %s frame(s) starting at %d but only received %d. Will pad the remainder with zeros.",
-            frame_count,
-            frame_type,
-            start_frame_index,
-            actual_frames
-        )
-
-    usable_bytes = actual_frames * bytes_per_frame
-    np_buffer = np.frombuffer(raw[:usable_bytes], dtype=np.uint8).copy()
-    frame_tensor = torch.from_numpy(np_buffer).view(actual_frames, extract_size, extract_size, 3).to(torch.uint8)
-    return frame_tensor
-
-
-class SegmentedDataFrameReader:
-    """Iterates through multiple MP4 segments as if they were a single continuous stream."""
-
-    def __init__(self, video_paths: List[Path], config: Dict, temp_dir: Path, initial_frame_offset: int, frame_type: str = 'data'):
-        self.video_paths = video_paths
+class ContinuousPipeFrameReader:
+    """
+    Reads multiple video files sequentially via a continuous FFmpeg pipe.
+    No seeking is performed; frames are read linearly to ensure 100% data integrity.
+    """
+    def __init__(self, video_paths: List[Path], config: Dict, frame_type: str = 'data'):
+        self.video_paths = deque(video_paths)
         self.config = config
-        self.temp_dir = temp_dir
-        self.initial_frame_offset = max(0, initial_frame_offset)
-        self.current_video_idx = 0
-        self.local_frame_idx = self.initial_frame_offset
-        self.offset_consumed = self.initial_frame_offset == 0
         self.frame_type = frame_type
+        self.process = None
+        self.current_path = None
+        
+        if frame_type == 'info':
+            self.extract_size = INFO_K_SIDE
+        elif frame_type == 'barcode':
+            self.extract_size = max(config.get("VIDEO_WIDTH", 720), config.get("VIDEO_HEIGHT", 720))
+        else:
+            self.extract_size = config.get("DATA_K_SIDE", 180)
+            
+        self.frame_bytes = self.extract_size * self.extract_size * 3
 
-    def _advance_video(self):
-        self.current_video_idx += 1
-        self.local_frame_idx = 0
-        self.offset_consumed = True
+    def _open_next_process(self):
+        if self.process:
+            self.process.terminate()
+            self.process = None
+        
+        if not self.video_paths:
+            return False
+            
+        self.current_path = self.video_paths.popleft()
+        logging.info(f"Opening read pipe for: {self.current_path.name}")
+        
+        scale_filter = (
+            f"scale={self.extract_size}:{self.extract_size}:flags=neighbor:force_original_aspect_ratio=decrease,"
+            f"pad={self.extract_size}:{self.extract_size}:(ow-iw)/2:(oh-ih)/2"
+        )
+        
+        command = [
+            self.config["FFMPEG_PATH"],
+            '-hide_banner', '-loglevel', 'error',
+            '-i', str(self.current_path),
+            '-vf', scale_filter,
+            '-pix_fmt', 'rgb24',
+            '-vsync', '0', 
+            '-f', 'rawvideo',
+            '-'
+        ]
+        
+        try:
+            # stderr=subprocess.DEVNULL to prevent deadlocks when buffer fills
+            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**7)
+            return True
+        except Exception as e:
+            logging.error(f"Failed to open ffmpeg pipe for {self.current_path}: {e}")
+            return False
 
-    def _current_video(self) -> Optional[Path]:
-        if self.current_video_idx >= len(self.video_paths):
-            return None
-        return self.video_paths[self.current_video_idx]
-
-    def _fallback_extract_frames(self, video_path: Path, start_index: int, frame_count: int) -> Optional[torch.Tensor]:
-        frames: List[torch.Tensor] = []
-        for offset in range(frame_count):
-            actual_frame = start_index + offset
-            frame = extract_frame_as_tensor(video_path, actual_frame, self.temp_dir, self.config, frame_type=self.frame_type)
-            if frame is None:
-                break
-            frames.append(frame)
-        if not frames:
-            return None
-        return torch.stack(frames)
-
-    def fetch_frames(self, desired_count: int) -> Optional[torch.Tensor]:
-        if desired_count <= 0:
-            return torch.empty((0, self.config['DATA_K_SIDE'], self.config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
-
-        collected = []
-        remaining = desired_count
-
-        while remaining > 0:
-            video_path = self._current_video()
-            if video_path is None:
-                break
-
-            if not self.offset_consumed:
-                self.local_frame_idx = self.initial_frame_offset
-                self.offset_consumed = True
-
-            batch_tensor = None
-            if self.frame_type == 'data':
-                batch_tensor = extract_frames_batch(video_path, self.local_frame_idx, remaining, self.config, frame_type='data')
-            elif self.frame_type == 'info':
-                batch_tensor = extract_frames_batch(video_path, self.local_frame_idx, remaining, self.config, frame_type='info')
-            elif self.frame_type == 'barcode':
-                batch_tensor = extract_frames_batch(video_path, self.local_frame_idx, remaining, self.config, frame_type='barcode')
-            if batch_tensor is None or batch_tensor.shape[0] == 0:
-                logging.warning(f"Failed batched extraction for {video_path} at frame {self.local_frame_idx}. Falling back to single-frame extraction.")
-                batch_tensor = self._fallback_extract_frames(video_path, self.local_frame_idx, remaining)
-
-            if batch_tensor is None or batch_tensor.shape[0] == 0:
-                logging.warning(f"No more frames available in {video_path}. Moving to next segment.")
-                self._advance_video()
+    def skip_frames(self, count: int):
+        """Skip N frames from the beginning of the stream."""
+        if count <= 0: return
+        logging.info(f"Skipping first {count} frames of the stream (metadata)...")
+        bytes_to_skip = count * self.frame_bytes
+        skipped = 0
+        while skipped < bytes_to_skip:
+            if not self.process:
+                if not self._open_next_process():
+                    return
+            
+            chunk_size = min(bytes_to_skip - skipped, self.frame_bytes * 100) 
+            raw = self.process.stdout.read(chunk_size)
+            if not raw:
+                self._open_next_process()
                 continue
+            skipped += len(raw)
 
-            collected.append(batch_tensor)
-            actual = batch_tensor.shape[0]
-            remaining -= actual
-            self.local_frame_idx += actual
-
-            if remaining > 0:
-                self._advance_video()
-
-        if not collected:
+    def fetch_frames(self, count: int) -> Optional[torch.Tensor]:
+        if count <= 0: return None
+        
+        collected_bytes = bytearray()
+        target_bytes = count * self.frame_bytes
+        
+        while len(collected_bytes) < target_bytes:
+            if not self.process:
+                if not self._open_next_process():
+                    break 
+            
+            needed = target_bytes - len(collected_bytes)
+            try:
+                chunk = self.process.stdout.read(needed)
+                if not chunk:
+                    self._open_next_process()
+                    continue
+                collected_bytes.extend(chunk)
+            except Exception as e:
+                logging.error(f"Error reading from pipe: {e}")
+                self._open_next_process()
+        
+        if not collected_bytes:
             return None
+            
+        actual_frames = len(collected_bytes) // self.frame_bytes
+        if actual_frames == 0:
+            return None
+            
+        np_buffer = np.frombuffer(collected_bytes[:actual_frames * self.frame_bytes], dtype=np.uint8)
+        return torch.from_numpy(np_buffer.copy()).view(actual_frames, self.extract_size, self.extract_size, 3).to(torch.uint8)
 
-        return torch.cat(collected, dim=0)
+    def close(self):
+        if self.process:
+            self.process.terminate()
 
 def decode_barcode(frame_tensor: torch.Tensor) -> Optional[Tuple[int, int]]:
     h, w, _ = frame_tensor.shape
@@ -1445,7 +1415,6 @@ def decode_data_frames_gpu(
     k_side = derived_params['DATA_K_SIDE']
     
     # Frames are already extracted at DATA_K_SIDE x DATA_K_SIDE resolution (no downscaling needed)
-    # Verify size and resize if necessary (should be rare)
     if frame_batch.shape[1:3] != (k_side, k_side):
         logging.warning(f"Frame batch size {frame_batch.shape[1:3]} != expected {k_side}x{k_side}, resizing...")
         frame_batch = torch.nn.functional.interpolate(
@@ -1462,12 +1431,9 @@ def decode_data_frames_gpu(
     bits_per_frame_extracted = actual_bits // num_frames if num_frames > 0 else 0
     
     # Remove padding from each frame individually, but respect actual total
-    # Each frame has max_bits_per_frame bits extracted, but only total_encoded_bits_per_frame are valid per frame
     if total_encoded_bits is not None and total_encoded_bits < expected_bits:
-        # Last frame(s) have extra padding beyond the actual payload
         valid_bits = coded_bits[:total_encoded_bits]
     else:
-        # Standard case: each frame has padding_per_frame bits of padding
         valid_bits_list = []
         for i in range(num_frames):
             start_idx = i * bits_per_frame_extracted
@@ -1520,15 +1486,15 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
                     return
                 video_paths.append(p)
 
+        # Log video order
+        logging.info(f"Decoding video sequence:")
+        for idx, p in enumerate(video_paths):
+            logging.info(f"  {idx+1}: {p.name}")
+
         primary_video = video_paths[0]
         multi_segment = len(video_paths) > 1
-        if multi_segment:
-            segment_lines = "\n".join(f"  [{idx+1}] {path.name}" for idx, path in enumerate(video_paths))
-            logging.info(f"Decoding will concatenate {len(video_paths)} segments:\n{segment_lines}")
-        else:
-            logging.info(f"Decoding single video: {primary_video}")
 
-        # Extract barcode frame at full 720x720
+        # Extract barcode frame at full 720x720 from primary video
         barcode_frame = extract_frame_as_tensor(primary_video, 0, temp_dir, config, frame_type='barcode')
         if barcode_frame is None:
             logging.error("Failed to extract barcode frame.")
@@ -1539,22 +1505,15 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         num_info_frames, _ = barcode_data
         
         # Extract info frames at 16x16 (INFO_K_SIDE)
-        if multi_segment:
-            info_reader = SegmentedDataFrameReader(video_paths, config, temp_dir, initial_frame_offset=1, frame_type='info')
-            info_frames_tensor = info_reader.fetch_frames(num_info_frames)
-            if info_frames_tensor is None or info_frames_tensor.shape[0] < num_info_frames:
-                logging.error("Failed to extract required info frames.")
+        # For info frames, we still use extraction by index because they are at the start of file 1
+        info_frames = []
+        for i in range(num_info_frames):
+            frame = extract_frame_as_tensor(primary_video, i + 1, temp_dir, config, frame_type='info')
+            if frame is None:
+                logging.error(f"Failed to extract info frame {i+1}. Aborting.")
                 return
-            info_frames = info_frames_tensor[:num_info_frames]
-        else:
-            info_frames = []
-            for i in range(num_info_frames):
-                frame = extract_frame_as_tensor(primary_video, i + 1, temp_dir, config, frame_type='info')
-                if frame is None:
-                    logging.error(f"Failed to extract info frame {i+1}. Aborting.")
-                    return
-                info_frames.append(frame)
-            info_frames = torch.stack(info_frames)
+            info_frames.append(frame)
+        info_frames = torch.stack(info_frames)
         
         info_syndrome_table = build_syndrome_lookup_table(INFO_H_MATRIX_TENSOR.to(device))
         session_params = decode_info_frames(info_frames, device, info_syndrome_table)
@@ -1576,7 +1535,8 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
 
         total_encoded_bits_budget = session_params.get("total_encoded_data_bits")
         
-        frame_idx_offset = 1 + num_info_frames
+        # Calculate how many frames to skip at start of video 1 (Barcode + Info)
+        skip_frame_count = 1 + num_info_frames
         
         if 'data_frame_count' in session_params:
             num_data_frames = session_params['data_frame_count']
@@ -1591,20 +1551,6 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         progress_bar = ConsoleProgressBar(num_data_frames, prefix="Decoding")
         progress_bar.start()
 
-        frame_producer_queue = None
-        if not multi_segment:
-            frame_producer_queue = queue.Queue(maxsize=8)
-            batch_size = config['GPU_PROCESSOR_BATCH_SIZE']
-            producer_thread = FrameProducerThread(
-                primary_video, 
-                frame_idx_offset, 
-                num_data_frames, 
-                batch_size, 
-                config, 
-                frame_producer_queue
-            )
-            producer_thread.start()
-        
         batch_size = config['GPU_PROCESSOR_BATCH_SIZE']
         total_corrected_data_codewords = 0
         use_cuda = device.type == "cuda"
@@ -1631,62 +1577,58 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
                 data_queue.put(np.packbits(ready_bits.cpu().numpy()).tobytes())
 
         try:
-            # Shared processing logic
-            def process_batch(batch_tensor):
-                 nonlocal total_encoded_bits_budget, next_decode_stream
-                 
-                 progress_bar.update(batch_tensor.shape[0])
+            # Use ContinuousPipeFrameReader for Data extraction
+            reader = ContinuousPipeFrameReader(video_paths, config, frame_type='data')
+            
+            # Skip the barcode and info frames on the first video
+            if skip_frame_count > 0:
+                reader.skip_frames(skip_frame_count)
 
-                 bits_per_frame_encoded = derived_params['total_encoded_bits_to_store_data']
-                 batch_frame_count = batch_tensor.shape[0]
-                 batch_bits = batch_frame_count * bits_per_frame_encoded
-                 bits_argument = None
-                 if total_encoded_bits_budget is not None:
-                     bits_argument = min(total_encoded_bits_budget, batch_bits)
-                     total_encoded_bits_budget = max(0, total_encoded_bits_budget - bits_argument)
+            while True:
+                if data_writer is not None and not data_writer.is_alive():
+                    logging.error("DataWriterThread died unexpectedly! Aborting decode.")
+                    break
 
-                 if use_cuda:
-                     pinned_batch = pin_tensor_if_possible(batch_tensor)
-                     stream = decode_streams[next_decode_stream]
-                     next_decode_stream = (next_decode_stream + 1) % len(decode_streams)
-                     with torch.cuda.stream(stream):
-                         batch_gpu = pinned_batch.to(device, non_blocking=True)
-                         decoded_bits, num_corrections = decode_data_frames_gpu(batch_gpu, derived_params, bits_argument, return_error_tensor=True)
-                         decoded_bits_cpu = decoded_bits.to("cpu", non_blocking=True)
-                     inflight_decodes.append((stream, decoded_bits_cpu, num_corrections))
-                 else:
-                     decoded_bits, num_corrections = decode_data_frames_gpu(batch_tensor.to(device), derived_params, bits_argument)
-                     inflight_decodes.append((None, decoded_bits.cpu(), num_corrections))
+                batch_tensor_cpu = reader.fetch_frames(batch_size)
+                
+                if batch_tensor_cpu is None:
+                    # Reader exhausted
+                    break
 
-                 flush_decoded_batches()
+                # Handle final batch padding if necessary (only if this is truly the end of data)
+                if batch_tensor_cpu.shape[0] < batch_size:
+                     deficit = batch_size - batch_tensor_cpu.shape[0]
+                     padding = torch.zeros((deficit, config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
+                     batch_tensor_cpu = torch.cat((batch_tensor_cpu, padding), dim=0)
 
-            if frame_producer_queue:
-                while True:
-                    if data_writer is not None and not data_writer.is_alive():
-                        logging.error("DataWriterThread died unexpectedly! Aborting decode.")
-                        break
-                    batch_tensor_cpu = frame_producer_queue.get()
-                    if batch_tensor_cpu is None: break
-                    process_batch(batch_tensor_cpu)
-            else:
-                reader = SegmentedDataFrameReader(video_paths, config, temp_dir, frame_idx_offset, frame_type='data')
-                for i in range(0, num_data_frames, batch_size):
-                    if data_writer is not None and not data_writer.is_alive():
-                        break
-                    start, end = i, min(i + batch_size, num_data_frames)
-                    batch_count = end - start
-                    batch_tensor_cpu = reader.fetch_frames(batch_count)
-                    if batch_tensor_cpu is None or batch_tensor_cpu.shape[0] == 0:
-                        # Fill remaining if stream ended unexpectedly
-                        batch_tensor_cpu = torch.zeros((batch_count, config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
-                    elif batch_tensor_cpu.shape[0] < batch_count:
-                        deficit = batch_count - batch_tensor_cpu.shape[0]
-                        padding = torch.zeros((deficit, config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
-                        batch_tensor_cpu = torch.cat((batch_tensor_cpu, padding), dim=0)
-                    
-                    process_batch(batch_tensor_cpu)
+                # Process Batch
+                progress_bar.update(batch_tensor_cpu.shape[0])
+
+                bits_per_frame_encoded = derived_params['total_encoded_bits_to_store_data']
+                batch_frame_count = batch_tensor_cpu.shape[0]
+                batch_bits = batch_frame_count * bits_per_frame_encoded
+                bits_argument = None
+                if total_encoded_bits_budget is not None:
+                    bits_argument = min(total_encoded_bits_budget, batch_bits)
+                    total_encoded_bits_budget = max(0, total_encoded_bits_budget - bits_argument)
+
+                if use_cuda:
+                    pinned_batch = pin_tensor_if_possible(batch_tensor_cpu)
+                    stream = decode_streams[next_decode_stream]
+                    next_decode_stream = (next_decode_stream + 1) % len(decode_streams)
+                    with torch.cuda.stream(stream):
+                        batch_gpu = pinned_batch.to(device, non_blocking=True)
+                        decoded_bits, num_corrections = decode_data_frames_gpu(batch_gpu, derived_params, bits_argument, return_error_tensor=True)
+                        decoded_bits_cpu = decoded_bits.to("cpu", non_blocking=True)
+                    inflight_decodes.append((stream, decoded_bits_cpu, num_corrections))
+                else:
+                    decoded_bits, num_corrections = decode_data_frames_gpu(batch_tensor_cpu.to(device), derived_params, bits_argument)
+                    inflight_decodes.append((None, decoded_bits.cpu(), num_corrections))
+
+                flush_decoded_batches()
             
             flush_decoded_batches(force=True)
+            reader.close()
 
         except KeyboardInterrupt:
             logging.warning("Keyboard interrupt during data decoding.")
