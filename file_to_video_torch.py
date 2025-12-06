@@ -87,6 +87,15 @@ def setup_pytorch() -> torch.device:
         device = torch.device("cpu")
     return device
 
+def check_ffmpeg_nvenc(ffmpeg_path: str) -> bool:
+    """Checks if the installed FFmpeg supports h264_nvenc."""
+    try:
+        cmd = [ffmpeg_path, '-encoders']
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return 'h264_nvenc' in result.stdout
+    except Exception:
+        return False
+
 def load_config() -> Dict[str, Any]:
     script_dir = Path(__file__).resolve().parent
     config_path = script_dir / CONFIG_FILENAME
@@ -846,12 +855,15 @@ class FFmpegConsumerThread(threading.Thread):
         # GPU Encoding Switch
         if self.config.get("ENABLE_NVENC", False):
             # GPU Settings (h264_nvenc)
+            # CHECK if nvenc is supported first? We rely on main config check, but here we construct cmd.
             logging.info(f"Using GPU Encoding (h264_nvenc) with CRF/CQ={crf}")
             codec_args = [
                 '-c:v', 'h264_nvenc',
                 '-preset', 'p1',      # Fastest preset
                 '-rc', 'vbr',         # Variable Bitrate to allow quality focus
                 '-cq', str(crf),      # Constant Quality
+                '-spatial-aq', '1',   # Help retain spatial details (edges)
+                '-temporal-aq', '1'   
             ]
         else:
             # CPU Settings (libx264)
@@ -915,21 +927,20 @@ class FFmpegConsumerThread(threading.Thread):
                 except (BrokenPipeError, OSError):
                     pass
             
-            # 2. Wait for process to exit normally and capture stderr
+            # 2. Wait for process to exit normally
             try:
-                # We typically don't read stdout as it's null, but we read stderr for errors
-                _, stderr = self.ffmpeg_process.communicate(timeout=10)
-                
-                if self.ffmpeg_process.returncode != 0:
-                    logging.error(f"FFmpeg process exited with error code {self.ffmpeg_process.returncode}")
-                    if stderr:
-                        logging.error(f"FFmpeg STDERR:\n{stderr.decode('utf-8', 'ignore')}")
+                self.ffmpeg_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 logging.warning("FFmpeg did not exit gracefully, terminating...")
                 self.ffmpeg_process.terminate()
-                _, stderr = self.ffmpeg_process.communicate()
-                if stderr:
-                     logging.error(f"FFmpeg STDERR (after term):\n{stderr.decode('utf-8', 'ignore')}")
+            
+            # 3. Check return code (ignore stderr since we directed it to PIPE but aren't reading it here unless error)
+            if self.ffmpeg_process.returncode != 0:
+                logging.error(f"FFmpeg process exited with error code {self.ffmpeg_process.returncode}")
+                # We can try to read stderr here if we want to debug
+                if self.ffmpeg_process.stderr:
+                     err_out = self.ffmpeg_process.stderr.read()
+                     logging.error(f"FFmpeg STDERR:\n{err_out.decode('utf-8', 'ignore')}")
 
         self.ffmpeg_process = None
         self.frames_written_in_segment = 0
@@ -983,10 +994,19 @@ class FFmpegConsumerThread(threading.Thread):
 
     def stop(self):
         self.stop_event.set()
-        # We assume the main loop will send None or we wait for it to drain
-        # If forced:
+        # Do not force terminate here immediately. Let the run loop finish or finalize handle it.
+        # But if we must:
         if self.ffmpeg_process:
-             self._finalize_current_segment()
+            if self.ffmpeg_process.stdin:
+                try:
+                    self.ffmpeg_process.stdin.close()
+                except:
+                    pass
+            try:
+                self.ffmpeg_process.wait(timeout=5)
+            except:
+                self.ffmpeg_process.terminate()
+        self._finalize_current_segment()
 
 def encode_orchestrator(input_path: Path, output_dir: Path, password: Optional[str], config: Dict, device: torch.device):
     encode_start = time.perf_counter()
@@ -1167,6 +1187,7 @@ class DataWriterThread(threading.Thread):
             
             while not self.stop_event.is_set():
                 try:
+                    # Non-blocking get with short timeout to check stop_event frequently
                     data_bytes = self.data_queue.get(timeout=0.5)
                     if data_bytes is None: break
                 except queue.Empty:
