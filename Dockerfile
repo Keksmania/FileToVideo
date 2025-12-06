@@ -1,7 +1,7 @@
 # Use official PyTorch image with CUDA 12.1 support
 FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
 
-# Prevent interactive prompts
+# Prevent interactive prompts during installation
 ENV DEBIAN_FRONTEND=noninteractive
 
 # 1. Install System Dependencies
@@ -18,9 +18,10 @@ RUN pip install --no-cache-dir \
     pillow \
     numpy
 
-# 3. Install FFmpeg 7.0 (Stable)
-# This version correctly detects NVENC libraries on WSL2/Docker
-RUN wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.0-latest-linux64-gpl-7.0.tar.xz -O /tmp/ffmpeg.tar.xz \
+# 3. Install FFmpeg 7.0 (Stable) from yt-dlp builds
+# We use the yt-dlp mirror because they keep stable release filenames consistent.
+# This build supports NVENC and libx264.
+RUN wget https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.0-latest-linux64-gpl-7.0.tar.xz -O /tmp/ffmpeg.tar.xz \
     && tar -xf /tmp/ffmpeg.tar.xz -C /tmp \
     && mv /tmp/ffmpeg-n7.0-latest-linux64-gpl-7.0/bin/ffmpeg /usr/local/bin/ffmpeg \
     && mv /tmp/ffmpeg-n7.0-latest-linux64-gpl-7.0/bin/ffprobe /usr/local/bin/ffprobe \
@@ -28,9 +29,12 @@ RUN wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n
     && chmod +x /usr/local/bin/ffprobe \
     && rm -rf /tmp/ffmpeg*
 
-# 4. Remove Conda FFmpeg (Critical: ensures we use the one we just installed)
+# 4. Remove the old Conda FFmpeg (Critical)
 RUN rm -f /opt/conda/bin/ffmpeg \
     && rm -f /opt/conda/bin/ffprobe
 
+# 5. Set working directory
 WORKDIR /app
+
+# 6. Default command
 CMD ["/bin/bash"]
