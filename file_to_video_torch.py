@@ -438,6 +438,7 @@ def hamming_decode_gpu(
     
     # Convert syndrome vector to indices
     m = h_matrix.shape[0]
+    # Must match the weights used in build_syndrome_lookup_table (0..m-1)
     powers_of_2 = 2 ** torch.arange(m, device=device, dtype=torch.long)
     
     syndrome_indices = torch.matmul(syndrome.float(), powers_of_2.float()).long()
@@ -1655,6 +1656,8 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         apply_snapshot_to_config(config, session_params.get("encode_config_snapshot"))
         
         # --- LEGACY COMPATIBILITY CHECK ---
+        # If the loaded manifest doesn't specify Hamming params (old version), 
+        # force the config to use the legacy Hamming(7,4) settings for this session.
         if "DATA_HAMMING_N" not in session_params.get("encode_config_snapshot", {}):
             logging.warning("Legacy video detected (missing Hamming params in manifest). Enforcing Hamming(7,4).")
             config["DATA_HAMMING_N"] = 7
