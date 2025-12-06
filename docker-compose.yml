@@ -13,8 +13,7 @@ services:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: 1
+            - count: 1
               capabilities: [gpu]
     # Keep the container running so we can exec commands into it
     command: tail -f /dev/null
