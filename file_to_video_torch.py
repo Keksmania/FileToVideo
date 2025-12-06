@@ -936,8 +936,7 @@ class FFmpegConsumerThread(threading.Thread):
         output_path = self._build_output_path(segment_index)
         command = self.ffmpeg_command_base + [str(output_path)]
         logging.info(f"Starting FFmpeg segment #{segment_index}: {output_path}")
-        # Capture stderr to pipe so we can read it on failure
-        self.ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.output_paths.append(output_path)
         self.frames_written_in_segment = 0
 
