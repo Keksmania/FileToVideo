@@ -850,9 +850,10 @@ class FFmpegConsumerThread(threading.Thread):
             codec_args = [
                 '-c:v', 'h264_nvenc',
                 '-preset', 'p1',      # Fastest preset
-                '-rc', 'vbr',         # Variable Bitrate
+                '-rc', 'vbr',         # Variable Bitrate to allow quality focus
                 '-cq', str(crf),      # Constant Quality
-                # REMOVED experimental flags that caused crashes
+                '-spatial-aq', '1',   # Help retain spatial details (edges)
+                '-temporal-aq', '1'   
             ]
         else:
             # CPU Settings (libx264)
