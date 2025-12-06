@@ -1,10 +1,10 @@
-# Use an official PyTorch image with CUDA support
+# Use official PyTorch image with CUDA 12.1 support
 FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
 
-# Prevent interactive prompts
+# Prevent interactive prompts during installation
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. Install basic tools (removed ffmpeg from apt)
+# 1. Install System Dependencies
 RUN apt-get update && apt-get install -y \
     p7zip-full \
     par2 \
@@ -13,13 +13,13 @@ RUN apt-get update && apt-get install -y \
     xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install Python dependencies
+# 2. Install Python Dependencies
 RUN pip install --no-cache-dir \
     pillow \
     numpy
 
-# 3. Manually install a Static FFmpeg build with NVENC support
-# We use the BtbN build which includes hardware acceleration enabled
+# 3. Install Static FFmpeg with NVENC (BtbN Build)
+# We download a master build that includes NVENC and libx264
 RUN wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -O /tmp/ffmpeg.tar.xz \
     && tar -xf /tmp/ffmpeg.tar.xz -C /tmp \
     && mv /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg /usr/local/bin/ffmpeg \
@@ -28,8 +28,13 @@ RUN wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-m
     && chmod +x /usr/local/bin/ffprobe \
     && rm -rf /tmp/ffmpeg*
 
-# Set the working directory
+# 4. CRITICAL FIX: Remove the old Conda FFmpeg
+# This ensures the system uses the new one we just installed in /usr/local/bin
+RUN rm -f /opt/conda/bin/ffmpeg \
+    && rm -f /opt/conda/bin/ffprobe
+
+# 5. Set working directory
 WORKDIR /app
 
-# Default command
+# 6. Default command
 CMD ["/bin/bash"]
