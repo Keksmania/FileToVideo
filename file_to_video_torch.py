@@ -852,8 +852,6 @@ class FFmpegConsumerThread(threading.Thread):
                 '-preset', 'p1',      # Fastest preset
                 '-rc', 'vbr',         # Variable Bitrate to allow quality focus
                 '-cq', str(crf),      # Constant Quality
-                '-spatial-aq', '1',   # Help retain spatial details (edges)
-                '-temporal-aq', '1'   
             ]
         else:
             # CPU Settings (libx264)
