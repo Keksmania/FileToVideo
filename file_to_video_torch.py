@@ -102,7 +102,7 @@ def load_config() -> Dict[str, Any]:
         "DATA_HAMMING_N": 127,
         "DATA_HAMMING_K": 120,
         "PAR2_REDUNDANCY_PERCENT": 1, 
-        "X264_CRF": 51,
+        "X264_CRF": 33,
         "KEYINT_MAX": 64,
         "MAX_VIDEO_SEGMENT_HOURS": 11,
         "CPU_WORKER_THREADS": 2,
@@ -875,8 +875,7 @@ class FFmpegConsumerThread(threading.Thread):
             logging.info(f"Using GPU Encoding (h264_nvenc) with CRF/CQ={crf}")
             codec_args = [
                 '-c:v', 'h264_nvenc',
-                '-preset', 'p1',      # Fastest preset
-                '-rc', 'vbr',         # Variable Bitrate to allow quality focus
+                '-preset', 'medium',      
                 '-cq', str(crf),      # Constant Quality
                 '-spatial-aq', '1',   # Help retain spatial details (edges)
                 '-temporal-aq', '1'   
