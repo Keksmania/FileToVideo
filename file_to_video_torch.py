@@ -108,7 +108,7 @@ def load_config() -> Dict[str, Any]:
         "CPU_WORKER_THREADS": 2,
         "ENABLE_NVENC": True,
         "VIDEO_FPS": 60,
-        "CPU_PRODUCER_CHUNK_MB": 64,
+        "CPU_PRODUCER_CHUNK_MB": 128,
         "PIPELINE_QUEUE_DEPTH": 64,
         "GPU_PROCESSOR_BATCH_SIZE": 512,
         "GPU_OVERLAP_STREAMS": 8
@@ -929,37 +929,35 @@ class FFmpegConsumerThread(threading.Thread):
         output_path = self._build_output_path(segment_index)
         command = self.ffmpeg_command_base + [str(output_path)]
         logging.info(f"Starting FFmpeg segment #{segment_index}: {output_path}")
-        self.ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # FIXED: Use sys.stderr to avoid pipe deadlock and enable visible error reporting
+        self.ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=sys.stderr)
         self.output_paths.append(output_path)
         self.frames_written_in_segment = 0
 
     def _finalize_current_segment(self):
         if self.ffmpeg_process:
-            # 1. Close stdin to signal EOF to ffmpeg (graceful shutdown)
+            logging.info("Finalizing video segment... (Flushing buffers & writing MP4 header)")
+            
+            # 1. Close stdin explicitly to send EOF to FFmpeg
             if self.ffmpeg_process.stdin:
                 try:
+                    self.ffmpeg_process.stdin.flush()
                     self.ffmpeg_process.stdin.close()
                 except (BrokenPipeError, OSError):
+                    # If pipe is already broken, FFmpeg might have crashed or closed it.
                     pass
             
             # 2. Wait for process to exit normally
             try:
-                self.ffmpeg_process.wait(timeout=5)
+                # We wait indefinitely here because +faststart on large files takes time.
+                self.ffmpeg_process.wait()
             except subprocess.TimeoutExpired:
                 logging.warning("FFmpeg did not exit gracefully, terminating...")
                 self.ffmpeg_process.terminate()
             
-            # 3. Check return code
+            # 3. Check return code (errors are now printed to console via sys.stderr)
             if self.ffmpeg_process.returncode != 0:
                 logging.error(f"FFmpeg process exited with error code {self.ffmpeg_process.returncode}")
-                # Try to read stderr for debug info
-                try:
-                    if self.ffmpeg_process.stderr:
-                        err_out = self.ffmpeg_process.stderr.read()
-                        if err_out:
-                            logging.error(f"FFmpeg STDERR:\n{err_out.decode('utf-8', 'ignore')}")
-                except Exception:
-                    pass
 
         self.ffmpeg_process = None
         self.frames_written_in_segment = 0
@@ -1064,6 +1062,18 @@ def encode_orchestrator(input_path: Path, output_dir: Path, password: Optional[s
         max_inflight = len(encode_streams) if encode_streams else 1
         next_stream_idx = 0
 
+        # FIXED: Safe Put Wrapper to detect consumer death and prevent hanging
+        def safe_queue_put(item):
+            while True:
+                try:
+                    # Try to put with a timeout to allow checking consumer health
+                    frame_queue.put(item, timeout=0.5)
+                    break
+                except queue.Full:
+                    if not consumer.is_alive():
+                        raise RuntimeError("FFmpeg Consumer died unexpectedly! Check console output for FFmpeg errors.")
+                    # If consumer is alive, loop and try again
+
         def flush_encoded_batches(force: bool = False) -> None:
             while inflight_batches and (force or len(inflight_batches) >= max_inflight):
                 stream, cpu_tensor = inflight_batches.popleft()
@@ -1072,14 +1082,24 @@ def encode_orchestrator(input_path: Path, output_dir: Path, password: Optional[s
                 if cpu_tensor is None or cpu_tensor.numel() == 0:
                     continue
                 ready_tensor = cpu_tensor.contiguous()
-                frame_queue.put(ready_tensor)
+                safe_queue_put(ready_tensor) # Use safe put
 
         try:
             logging.info("--- Starting main processing pipeline ---")
-            frame_queue.put(barcode_frame_batch)
-            frame_queue.put(info_frames_batch)
+            safe_queue_put(barcode_frame_batch)
+            safe_queue_put(info_frames_batch)
             while True:
-                bits_tensor_cpu = data_queue.get()
+                # Also check consumer health while waiting for data
+                try:
+                    bits_tensor_cpu = data_queue.get(timeout=0.5)
+                except queue.Empty:
+                    if not consumer.is_alive():
+                         raise RuntimeError("FFmpeg Consumer died unexpectedly while waiting for data.")
+                    if not producer.is_alive() and data_queue.empty():
+                         # Producer finished and queue empty
+                         break
+                    continue
+
                 if bits_tensor_cpu is None:
                     break
                 
@@ -1108,11 +1128,24 @@ def encode_orchestrator(input_path: Path, output_dir: Path, password: Optional[s
             logging.warning("Keyboard interrupt detected. Shutting down pipeline.")
             producer.stop(); consumer.stop()
         except Exception as e:
-            logging.error(f"Error in main processing loop: {e}", exc_info=True)
+            logging.error(f"Error in main processing loop: {e}")
             producer.stop(); consumer.stop()
         finally:
             if progress_bar: progress_bar.stop()
-            frame_queue.put(None)
+            
+            # --- CRITICAL FIX: Loop until Stop Signal is Accepted ---
+            logging.info("Signaling FFmpeg consumer to finish...")
+            while True:
+                try:
+                    # Attempt to put the sentinel. If full, wait 1s then retry.
+                    frame_queue.put(None, timeout=1)
+                    break
+                except queue.Full:
+                    if not consumer.is_alive():
+                        logging.error("Consumer thread died while trying to send stop signal.")
+                        break
+                    logging.info("Waiting for queue space to send stop signal...")
+
             logging.info("Waiting for producer thread to finish...")
             producer.join()
             logging.info("Producer thread finished. Waiting for FFmpeg consumer to flush to disk...")
