@@ -9,12 +9,21 @@ set "missing_desc!missing_count!=%~2"
 exit /b
 
 :CheckCommand
+:: 1. Check Global PATH
 where %~1 >nul 2>&1
-if errorlevel 1 (
-    call :AddMissing "%~2" "%~3"
-) else (
-    echo ^> %~2
+if %errorlevel% EQU 0 (
+    echo [OK] Found %~1 in PATH
+    exit /b
 )
+
+:: 2. Check Current Folder (Script Directory)
+if exist "%~dp0%~1.exe" (
+    echo [OK] Found %~1 in script folder
+    exit /b
+)
+
+:: 3. Fail
+call :AddMissing "%~2" "%~3"
 exit /b
 
 :CheckPython
@@ -51,7 +60,7 @@ if %PY_MAJOR_NUM% LSS 3 (
     exit /b
 )
 set "PY_AVAILABLE=1"
-echo ^> Python %PY_VERSION%
+echo [OK] Python %PY_VERSION%
 exit /b
 
 :CheckTorch
@@ -71,35 +80,39 @@ set "TORCH_SCRIPT=%TEMP%\f2yt_torch_%RANDOM%_%RANDOM%.py"
 >> "%TORCH_SCRIPT%" echo print('INSTALLED=' + ('1' if state['installed'] else '0'))
 >> "%TORCH_SCRIPT%" echo print('CUDA=' + ('1' if state['cuda'] else '0'))
 >> "%TORCH_SCRIPT%" echo print('VERSION=' + (state['version'] or 'unknown'))
+
 "%PYTHON_CMD%" "%TORCH_SCRIPT%" > "%TEMP%\torch_state.txt" 2>nul
 del "%TORCH_SCRIPT%" >nul 2>&1
-if errorlevel 1 (
-    call :AddMissing "PyTorch" "Install the CUDA-enabled PyTorch build from pytorch.org."
-    exit /b
-)
+
 set "TORCH_INSTALLED="
 set "TORCH_CUDA="
 set "TORCH_VERSION=unknown"
+
 for /f "usebackq tokens=1,2 delims==" %%a in ("%TEMP%\torch_state.txt") do (
     if /I "%%a"=="INSTALLED" set "TORCH_INSTALLED=%%b"
     if /I "%%a"=="CUDA" set "TORCH_CUDA=%%b"
     if /I "%%a"=="VERSION" set "TORCH_VERSION=%%b"
 )
 del "%TEMP%\torch_state.txt" >nul 2>&1
+
 if "!TORCH_INSTALLED!" NEQ "1" (
     call :AddMissing "PyTorch" "Install the CUDA-enabled PyTorch build from pytorch.org."
     exit /b
 )
+
 if "!TORCH_CUDA!"=="1" (
-    echo ^> PyTorch !TORCH_VERSION! (CUDA available^)
+    echo [OK] PyTorch !TORCH_VERSION! - CUDA available
 ) else (
-    echo ^> PyTorch !TORCH_VERSION! (CUDA NOT detected^)
+    echo [WARNING] PyTorch !TORCH_VERSION! - CUDA NOT detected
     call :AddMissing "CUDA for PyTorch" "torch.cuda.is_available() returned False. Install NVIDIA drivers/CUDA toolkit."
 )
 exit /b
 
 :main
-echo PythonFileToYoutube dependency check (Windows CMD)
+cls
+echo ----------------------------------------------------
+echo  PythonFileToYoutube Dependency Checker (Windows)
+echo ----------------------------------------------------
 set "missing_count=0"
 if defined PYTHON_BIN (
     set "PYTHON_CMD=%PYTHON_BIN%"
@@ -110,13 +123,15 @@ set "PYTHON_CMD=%PYTHON_CMD:"=%"
 
 call :CheckPython
 call :CheckTorch
-call :CheckCommand ffmpeg "FFmpeg" "Install FFmpeg and ensure it is on PATH."
-call :CheckCommand 7z "7-Zip CLI" "Install 7-Zip / p7zip and expose '7z'."
-call :CheckCommand par2 "PAR2" "Install par2cmdline and expose 'par2'."
-call :CheckCommand nvidia-smi "CUDA / NVIDIA driver" "Install NVIDIA drivers/CUDA toolkit so 'nvidia-smi' works."
+echo.
+call :CheckCommand ffmpeg "FFmpeg" "Install FFmpeg (or drop ffmpeg.exe here)"
+call :CheckCommand 7z "7-Zip CLI" "Install 7-Zip (or drop 7z.exe here)"
+call :CheckCommand par2 "PAR2" "Install par2cmdline (or drop par2.exe here)"
 
+echo.
 if %missing_count% EQU 0 (
-    echo All dependencies satisfied.
+    echo [SUCCESS] All dependencies satisfied.
+    pause
     exit /b 0
 )
 echo.
@@ -124,4 +139,6 @@ echo Missing dependencies:
 for /l %%i in (1,1,%missing_count%) do (
     echo - !missing_name%%i!: !missing_desc%%i!
 )
+echo.
+pause
 exit /b 1
