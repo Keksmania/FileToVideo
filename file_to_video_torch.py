@@ -895,7 +895,7 @@ class FFmpegConsumerThread(threading.Thread):
             logging.info(f"Using CPU Encoding (libx264) with CRF={crf}")
             codec_args = [
                 '-c:v', 'libx264',
-                '-preset', 'ultrafast',
+                '-preset', 'slow',
                 '-tune', 'stillimage',
                 '-crf', str(crf),
             ]
