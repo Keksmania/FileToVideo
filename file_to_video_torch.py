@@ -1288,41 +1288,6 @@ class DataWriterThread(threading.Thread):
             logging.info("DataWriterThread finished.")
     def stop(self): self.stop_event.set()
 
-def extract_frame_as_tensor(video_path: Path, frame_index: int, temp_dir: Path, config: Dict, frame_type: str = 'data') -> Optional[torch.Tensor]:
-    """Extract a specific frame from video using frame-accurate seeking."""
-    ffmpeg_path = config["FFMPEG_PATH"]
-    fps = config.get("VIDEO_FPS", 60)
-    
-    if frame_type == 'barcode':
-        extract_size = 720
-    elif frame_type == 'info':
-        extract_size = INFO_K_SIDE
-    else:
-        extract_size = config.get("DATA_K_SIDE", 180)
-    
-    timestamp = frame_index / fps
-    command = [
-        ffmpeg_path, '-hide_banner', '-loglevel', 'error',
-        '-accurate_seek',
-        '-seek_timestamp', '1',
-        '-ss', f'{timestamp:.6f}',
-        '-i', str(video_path),
-        '-vframes', '1',
-        '-vf', f'scale={extract_size}:{extract_size}:force_original_aspect_ratio=decrease,pad={extract_size}:{extract_size}:(ow-iw)/2:(oh-ih)/2',
-        '-f', 'image2pipe', '-vcodec', 'png', '-'
-    ]
-    try:
-        proc = subprocess.run(command, capture_output=True, check=True, timeout=10)
-        img_bytes = proc.stdout
-        with Image.open(io.BytesIO(img_bytes)) as img:
-            img_rgb = img.convert('RGB')
-            np_frame = np.array(img_rgb)
-            if np_frame.shape[:2] != (extract_size, extract_size):
-                np_frame = np.array(Image.fromarray(np_frame).resize((extract_size, extract_size), Image.Resampling.NEAREST))
-        return torch.from_numpy(np_frame)
-    except Exception as e:
-        logging.error(f"Failed to extract frame {frame_index}: {e}")
-        return None
 
 def extract_frames_batch(video_path: Path, start_frame_index: int, frame_count: int, config: Dict, frame_type: str = 'data') -> Optional[torch.Tensor]:
     """Extract a batch using seeking. Only used for Info/Barcode or single-file fallback."""
@@ -1667,25 +1632,28 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         multi_segment = len(video_paths) > 1
 
         # Extract barcode frame at full 720x720 from primary video
-        barcode_frame = extract_frame_as_tensor(primary_video, 0, temp_dir, config, frame_type='barcode')
-        if barcode_frame is None:
+        barcode_frame_batch = extract_frames_batch(primary_video, 0, 1, config, frame_type='barcode')
+        if barcode_frame_batch is None or barcode_frame_batch.shape[0] == 0:
             logging.error("Failed to extract barcode frame.")
             return
+        barcode_frame = barcode_frame_batch[0]
         barcode_data = decode_barcode(barcode_frame)
         if barcode_data is None:
             return
         num_info_frames, _ = barcode_data
         
         # Extract info frames at 16x16 (INFO_K_SIDE)
-        # For info frames, we still use extraction by index because they are at the start of file 1
-        info_frames = []
-        for i in range(num_info_frames):
-            frame = extract_frame_as_tensor(primary_video, i + 1, temp_dir, config, frame_type='info')
-            if frame is None:
-                logging.error(f"Failed to extract info frame {i+1}. Aborting.")
-                return
-            info_frames.append(frame)
-        info_frames = torch.stack(info_frames)
+        # Use a single batched ffmpeg call to avoid per-frame seeking inconsistencies
+        if num_info_frames <= 0:
+            logging.error("No info frames indicated in barcode; aborting.")
+            return
+        # Read from start of file to avoid tiny seeks (frag files sometimes have imprecise seek behavior)
+        batch = extract_frames_batch(primary_video, 0, num_info_frames + 1, config, frame_type='info')
+        if batch is None or batch.shape[0] < (num_info_frames + 1):
+            logging.error(f"Failed to extract info frames batch (expected {num_info_frames+1}, got {0 if batch is None else batch.shape[0]}). Aborting.")
+            return
+        # First frame is barcode (frame 0); info frames follow
+        info_frames = batch[1:1+num_info_frames]
         
         info_syndrome_table = build_syndrome_lookup_table(INFO_H_MATRIX_TENSOR.to(device))
         session_params = decode_info_frames(info_frames, device, info_syndrome_table)
