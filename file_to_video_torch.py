@@ -884,17 +884,11 @@ class FFmpegConsumerThread(threading.Thread):
             # GPU Settings (HEVC / H.265) optimized for random B&W noise
             logging.info(f"Using GPU Encoding (hevc_nvenc) with CQ={GPU_CRF}")
             codec_args = [
-                '-c:v', 'hevc_nvenc',
-                '-preset', 'p6',      # Slower encode, much better compression
-                '-tune', 'hq',
-                '-cq', str(GPU_CRF),
-                '-rc', 'vbr',
-                '-b:v', '0',
-                '-bf', '0',           # CRITICAL: No B-Frames for random noise
-                '-refs', '1',         # CRITICAL: Limit reference frames
-                '-spatial-aq', '0',   # CRITICAL: Disable AQ, stops wasting bits on noise
-                '-temporal-aq', '0',
-                '-tag:v', 'hvc1'
+                '-c:v', 'h264_nvenc',
+                '-preset', 'medium',      
+                '-cq', str(GPU_CRF),      # Constant Quality
+                '-spatial-aq', '1',   # Help retain spatial details (edges)
+                '-temporal-aq', '1',
             ]
         else:
             # CPU Settings (libx264)
