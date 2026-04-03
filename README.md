@@ -1,19 +1,18 @@
-# PythonFileToYoutube
+# File To Video
 
 Turn any file or folder into one or more MP4 videos (and back again) using the `file_to_video_torch.py` script. 
 The script is optimized for YouTube storage (robustness against compression).
 
 ## Features
 
-- **End-to-end pipeline**: Archive → Error-Correction (PAR2) → Frame Encoding → Video Stream.
+- **End-to-end pipeline**: Archive → PAR2 for Block redundancy -> Hamming codes for redundancy within a frame → Video Stream.
 - **GPU-accelerated**: Uses PyTorch (CUDA) for high-performance frame generation.
-- **NVENC Support**: Hardware video encoding for massive speed gains.
 - **Robust Redundancy**: Splits files into 1GB chunks and generates recovery records.
-- **Cross-platform**: Works on Windows and Linux (Docker recommended).
-
+- **Cross-platform**: Works on Windows and Linux.
+- **Backwards-compatible**: Even if some settings need to be changed in the future, the old encoded files should still work, since the decoder extracts encoding settings directly from the video!
 ---
 
-## 🐳 Option 1: Docker (Recommended)
+## 🐳 Option 1: Docker
 
 Docker handles all dependencies (Python, FFmpeg, 7-Zip, PAR2) automatically. You only need GPU drivers.
 
@@ -97,7 +96,7 @@ python file_to_video_torch.py -mode [encode|decode] -input "[path]"
 
 ## ⚙️ Configuration (`f2yt_config.json`)
 
-On the first run, the script generates `f2yt_config.json`. You can edit this to tune performance or change paths.
+On the first run, the script generates `f2yt_config.json`. You can edit this to tune performance or change paths. (MAKE SURE A ROUNDTRIP WORKS BEFORE STORING DATA TO A GIVEN PLATFORM)
 
 ### Tools & Output
 | Key | Default | Description |
@@ -117,9 +116,10 @@ On the first run, the script generates `f2yt_config.json`. You can edit this to 
 | `DATA_HAMMING_N` | `127` | Hamming Block Size (Error correction density). |
 | `DATA_HAMMING_K` | `120` | Hamming Data Size (Payload per block). |
 | `ENABLE_NVENC` | `true` | Use NVIDIA GPU hardware encoding. Automatically disables if no GPU found. |
-| `X264_CRF` | `33` | Video quality factor (Lower = Higher Quality). 33 balances size/safety. |
-| `KEYINT_MAX` | `64` | Max Keyframe Interval. Controls seeking speed and compression efficiency. |
-| `PAR2_REDUNDANCY_PERCENT` | `1` | Percentage of extra recovery data (external to the video stream). |
+| `X264_CRF` | `36` | Video quality factor for CPU encoding (Lower = Higher Quality). 36 balances size/safety. |
+| `GPU_CRF` | `33` |  Video quality factor for GPU encoding (Lower = Higher Quality). 36 balances size/safety. |
+| `KEYINT_MAX` | `600` | Max Keyframe Interval. Controls seeking speed and compression efficiency. |
+| `PAR2_REDUNDANCY_PERCENT` | `1` | Percentage of extra recovery data (external to the video stream). Adding "more" does not necessarily make a video safer, since more data will be in the payload. 1% worked quire well in my testing |
 | `MAX_VIDEO_SEGMENT_HOURS` | `11` | Splits output MP4s if they exceed this duration (YouTube limit). |
 
 ### Performance Tuning
@@ -128,7 +128,7 @@ On the first run, the script generates `f2yt_config.json`. You can edit this to 
 | `CPU_WORKER_THREADS` | `2` | Number of threads converting bytes to bits. |
 | `CPU_PRODUCER_CHUNK_MB` | `128` | How many MBs of the source file to read into RAM at once. |
 | `PIPELINE_QUEUE_DEPTH` | `64` | How many prepared batches to buffer in RAM before the GPU takes them. |
-| `GPU_PROCESSOR_BATCH_SIZE` | `512` | How many frames the GPU renders in a single CUDA call. |
+| `GPU_PROCESSOR_BATCH_SIZE` | `512` | How many frames the GPU renders in a single CUDA call. Increasing this will speed up processing, but it depends on the VRAM of your GPU. 512 works for 8GB of VRAM |
 | `GPU_OVERLAP_STREAMS` | `8` | Number of concurrent CUDA streams for parallel processing. |
 
 ---
@@ -145,6 +145,24 @@ If you put `ffmpeg.exe` etc. in the project folder but the script fails, verify 
     "PAR2_PATH": ".\\par2.exe"
 }
 ```
+### File cannot be recovered before even uploading
+Make sure that the CRF values are small enough to not create blurry edges. Before upload the edges of the squares need to be almost perfect. 
+If you changed the default settings try setting them back.
+
+### File cannot be recovered after upoloading and downloading
+Make sure you downloaded the best quality version and in 60FPS. Youtube processing takes some time. Make sure the 720p 60fps version is available. 
+If you provided password is correct and it still doesnt work, sadly nothing can be done.
+Before uploading try setting the CRF value lower. 
+I recommend trying the default settings and testing each upload once.
+
+### Cuda does not work in docker
+Make sure that the host machine has the necessary NVIDIA drivers installed.
+
+### Cuda is crashing
+Try setting GPU_PROCESSOR_BATCH_SIZE lower. 512 was tested with a 8GB rtx 3070ti.
+
+
+
 
 ## License
 MIT
