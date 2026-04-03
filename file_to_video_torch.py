@@ -42,6 +42,8 @@ DECODE_CONFIG_EXPORT_KEYS = [
 ]
 
 # --- PyTorch Constants ---
+_CUDA_AVAILABLE: bool = torch.cuda.is_available()
+
 INFO_HAMMING_K = 4
 INFO_HAMMING_N = 7
 INFO_K_SIDE = 16
@@ -71,7 +73,7 @@ def setup_logging(level=logging.INFO):
     logging.basicConfig(level=level, format="[%(levelname)s] %(asctime)s - %(message)s", datefmt="%H:%M:%S", stream=sys.stdout)
 
 def setup_pytorch() -> torch.device:
-    if torch.cuda.is_available():
+    if _CUDA_AVAILABLE:
         device = torch.device("cuda")
         props = torch.cuda.get_device_properties(device)
         logging.info(f"Found GPU: {props.name} with {props.total_memory / 1e9:.2f} GB of memory.")
@@ -101,9 +103,9 @@ def load_config() -> Dict[str, Any]:
         "DATA_HAMMING_N": 127,
         "DATA_HAMMING_K": 120,
         "PAR2_REDUNDANCY_PERCENT": 1, 
-        "X264_CRF": 38,
+        "X264_CRF": 36,
         "GPU_CRF": 33,
-        "KEYINT_MAX": 250,
+        "KEYINT_MAX": 600,
         "MAX_VIDEO_SEGMENT_HOURS": 11,
         "CPU_WORKER_THREADS": 2,
         "ENABLE_NVENC": True,
@@ -133,7 +135,6 @@ def load_config() -> Dict[str, Any]:
 
 
 def capture_decode_config_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Collect critical encode settings required for decoding on another machine."""
     snapshot = {}
     for key in DECODE_CONFIG_EXPORT_KEYS:
         if key in config and config[key] is not None:
@@ -144,7 +145,6 @@ def capture_decode_config_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def apply_snapshot_to_config(config: Dict[str, Any], snapshot: Optional[Dict[str, Any]]) -> None:
-    """Override local config with manifest-provided settings when available."""
     if not snapshot:
         logging.warning("Manifest missing encode_config_snapshot; using local configuration values.")
         return
@@ -163,7 +163,6 @@ def apply_snapshot_to_config(config: Dict[str, Any], snapshot: Optional[Dict[str
 
 
 def cleanup_temp_dir(temp_path: Path, label: str) -> None:
-    """Best-effort removal of a temporary working directory."""
     if temp_path.exists():
         try:
             time.sleep(1.0)
@@ -174,22 +173,16 @@ def cleanup_temp_dir(temp_path: Path, label: str) -> None:
 
 
 def pin_tensor_if_possible(tensor: torch.Tensor) -> torch.Tensor:
-    """Pin CPU tensor memory to enable async GPU transfers when CUDA is available."""
     if tensor.device.type != "cpu":
         return tensor
-    if not torch.cuda.is_available():
+    if not _CUDA_AVAILABLE:   
         return tensor
     try:
         return tensor.pin_memory()
     except RuntimeError:
-        logging.debug("pin_memory not supported for this tensor; continuing without pinning.")
         return tensor
 
 def sanitize_filename(name: str) -> str:
-    """
-    Sanitizes filenames to be safe for cross-platform usage.
-    Note: This is strictly for file names/stems, not paths.
-    """
     return re.sub(r'[^a-zA-Z0-9\._-]', '', name)
 
 # --- UI Helper Classes ---
@@ -300,9 +293,14 @@ def tensor_to_frame(bits_tensor: torch.Tensor, k_side: int, palette: torch.Tenso
         bits_tensor = torch.cat((bits_tensor, padding))
     bits_for_frame = bits_tensor[:required_bits]
     bit_groups = bits_for_frame.view(num_pixels, bits_per_color)
-    powers_of_2 = 2 ** torch.arange(bits_per_color - 1, -1, -1, device=device, dtype=torch.long)
     palette = palette.to(device)
-    palette_indices = torch.matmul(bit_groups.float(), powers_of_2.float()).long()
+    
+    if bits_per_color == 1:
+        palette_indices = bit_groups.view(num_pixels).long()
+    else:
+        powers_of_2 = 2 ** torch.arange(bits_per_color - 1, -1, -1, device=device, dtype=torch.long)
+        palette_indices = torch.matmul(bit_groups.float(), powers_of_2.float()).long()
+        
     pixel_data = torch.nn.functional.embedding(palette_indices, palette)
     num_channels = palette.shape[1]
     frame_tensor = pixel_data.view(k_side, k_side, num_channels)
@@ -330,9 +328,14 @@ def bit_chunks_to_frame_batch(
         frame_bit_chunks = frame_bit_chunks[:, :required_bits]
 
     bit_groups = frame_bit_chunks.view(num_frames, num_pixels, bits_per_color)
-    powers_of_2 = 2 ** torch.arange(bits_per_color - 1, -1, -1, device=device, dtype=torch.long)
     palette = palette.to(device)
-    palette_indices = torch.matmul(bit_groups.float(), powers_of_2.float()).long()
+    
+    if bits_per_color == 1:
+        palette_indices = bit_groups.view(num_frames, num_pixels).long()
+    else:
+        powers_of_2 = 2 ** torch.arange(bits_per_color - 1, -1, -1, device=device, dtype=torch.long)
+        palette_indices = torch.matmul(bit_groups.float(), powers_of_2.float()).long()
+        
     pixel_data = torch.nn.functional.embedding(palette_indices, palette)
     num_channels = palette.shape[1]
     return pixel_data.view(num_frames, k_side, k_side, num_channels).to(torch.uint8)
@@ -343,8 +346,9 @@ def generate_palette_tensor(num_colors: int, device: torch.device) -> torch.Tens
         num_colors = 2
     palettes = {
         2: [[0, 0, 0], [255, 255, 255]],
-        4: [[0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255]],
-        8: [[0,0,0], [255,0,0], [0,255,0], [0,0,255], [255,255,0], [255,0,255], [0,255,255], [255,255,255]],
+        # CRITICAL UPDATE: 4-color uses pure grayscale to survive YUV420p video Luma encoding
+        4: [[0, 0, 0], [85, 85, 85], [170, 170, 170], [255, 255, 255]],
+        8: [[0,0,0], [36,36,36], [73,73,73], [109,109,109], [146,146,146], [182,182,182], [219,219,219], [255,255,255]],
     }
     if num_colors not in palettes:
         logging.warning(f"No predefined palette for {num_colors} colors. Generating a grayscale ramp.")
@@ -357,11 +361,34 @@ def frame_to_bits_batch(frame_batch: torch.Tensor, palette: torch.Tensor, bits_p
     device = frame_batch.device
     num_frames, h, w, c = frame_batch.shape
 
-    pixels = frame_batch.view(num_frames * h * w, c).float()
-    palette = palette.to(device).float()
-    distances = torch.cdist(pixels, palette)
-    indices = torch.argmin(distances, dim=1)
+    pixels = frame_batch.view(num_frames * h * w, c)
+    palette_dev = palette.to(device)
+
+    num_colors = palette_dev.shape[0]
     
+    if num_colors == 2:
+        # Fast path: 2-color checking ONLY Green channel (index 1)
+        green_channel = pixels[:, 1]
+        indices = (green_channel > 127).to(torch.uint8) 
+    elif num_colors == 4 and palette_dev[1, 1] == 85:
+        # Fast path: 4-color Grayscale via PyTorch Bucketize
+        green_channel = pixels[:, 1].contiguous()
+        # Thresholds perfectly between 0, 85, 170, 255
+        boundaries = torch.tensor([42, 127, 212], dtype=torch.uint8, device=device)
+        indices = torch.bucketize(green_channel, boundaries, right=False).to(torch.uint8)
+    else:
+        # General path: squared L2
+        pf = pixels.float()                                    
+        qf = palette_dev.float()                               
+        pf_sq = (pf * pf).sum(dim=1, keepdim=True)            
+        qf_sq = (qf * qf).sum(dim=1)                          
+        cross  = pf @ qf.t()                                   
+        distances = pf_sq + qf_sq - 2.0 * cross               
+        indices = distances.argmin(dim=1)
+
+    if bits_per_color == 1:
+        return indices.view(-1).to(torch.uint8)
+
     unpacked_bits = []
     for i in range(bits_per_color - 1, -1, -1):
         unpacked_bits.append((indices >> i) & 1)
@@ -371,10 +398,6 @@ def frame_to_bits_batch(frame_batch: torch.Tensor, palette: torch.Tensor, bits_p
 # --- Hamming Matrix Generation ---
 
 def generate_systematic_hamming_matrices(n: int, k: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Generates G (Generator) and H (Parity Check) matrices for a Hamming(n, k) code
-    in systematic form: G = [I_k | P], H = [P^T | I_m].
-    """
     m = n - k
     if n != (2**m - 1):
         raise ValueError(f"Invalid Hamming code parameters: n={n} is not 2^{m}-1")
@@ -383,7 +406,6 @@ def generate_systematic_hamming_matrices(n: int, k: int, device: torch.device) -
     data_cols_ints = []
     
     for i in range(1, n + 1):
-        # check if power of 2
         if (i & (i - 1) == 0):
             parity_cols_ints.append(i)
         else:
@@ -392,18 +414,9 @@ def generate_systematic_hamming_matrices(n: int, k: int, device: torch.device) -
     parity_cols_ints.sort()
     data_cols_ints.sort()
     
-    # Combine: [Data Cols | Parity Cols]
     sorted_ints = torch.tensor(data_cols_ints + parity_cols_ints, dtype=torch.long, device=device)
-    
-    # Convert to binary matrix H (m x n)
     H = ((sorted_ints.unsqueeze(0) >> torch.arange(m, device=device).unsqueeze(1)) & 1).to(torch.uint8)
-    
-    # Now extract P^T. H = [P^T | I_m].
-    # P^T is the first k columns of H.
     P_T = H[:, :k]
-    
-    # G = [I_k | P].
-    # P is (k x m). P^T is (m x k).
     P = P_T.t()
     
     I_k = torch.eye(k, dtype=torch.uint8, device=device)
@@ -414,23 +427,21 @@ def generate_systematic_hamming_matrices(n: int, k: int, device: torch.device) -
 def build_syndrome_lookup_table(h_matrix: torch.Tensor) -> torch.Tensor:
     n, m = h_matrix.shape[1], h_matrix.shape[0]
     device = h_matrix.device
-    
+
     table_size = 2**m
     error_patterns = torch.zeros(table_size, n, dtype=torch.uint8, device=device)
-    
-    # Reconstruct column integers from H rows
+
     weights = 2 ** torch.arange(m, device=device, dtype=torch.long)
-    
-    # syndrome_ints[i] is the syndrome value if error is at bit i
-    # Use float for matmul then cast to long
     syndrome_ints_for_cols = torch.matmul(weights.float(), h_matrix.float()).long()
-    
+
+    synds_cpu = syndrome_ints_for_cols.cpu().numpy()          
+    seen: set = set()
     for col_idx in range(n):
-        s_val = syndrome_ints_for_cols[col_idx].item()
-        if s_val > 0 and s_val < table_size:
-            if torch.sum(error_patterns[s_val]) == 0:
-                error_patterns[s_val, col_idx] = 1
-                
+        s_val = int(synds_cpu[col_idx])
+        if 0 < s_val < table_size and s_val not in seen:
+            seen.add(s_val)
+            error_patterns[s_val, col_idx] = 1
+
     return error_patterns
 
 def hamming_decode_gpu(
@@ -439,28 +450,29 @@ def hamming_decode_gpu(
     k: int,
     syndrome_table: torch.Tensor,
     debug: bool = False,
-    return_error_tensor: bool = False
+    return_error_tensor: bool = False,
+    h_t: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, Union[int, torch.Tensor]]:
     n = h_matrix.shape[1]
     device = received_bits.device
     codewords = received_bits.view(-1, n)
     
-    # Calculate Syndrome: S = r * H^T
-    # OPTIMIZATION: Use Half Precision (float16) if on CUDA for speed
+    if h_t is None:
+        if device.type == 'cuda':
+            h_t = h_matrix.t().half().to(device)
+        else:
+            h_t = h_matrix.t().float().to(device)
+            
     if device.type == 'cuda':
-        h_t = h_matrix.t().half().to(device)
         codewords_f = codewords.half()
         syndrome = (torch.matmul(codewords_f, h_t) % 2).long()
     else:
-        h_t = h_matrix.t().float().to(device)
         syndrome = (torch.matmul(codewords.float(), h_t) % 2).long()
     
-    # Convert syndrome vector to indices
     m = h_matrix.shape[0]
-    # Must match the weights used in build_syndrome_lookup_table (0..m-1)
     powers_of_2 = 2 ** torch.arange(m, device=device, dtype=torch.long)
     
-    syndrome_indices = torch.matmul(syndrome.float(), powers_of_2.float()).long()
+    syndrome_indices = (syndrome * powers_of_2.unsqueeze(0)).sum(dim=1)  
     
     error_count_tensor = (syndrome_indices > 0).sum()
     if return_error_tensor:
@@ -489,13 +501,11 @@ def prepare_files_for_encoding(input_path: Path, temp_dir: Path, config: Dict, p
     
     payload_archive_base = temp_dir / "payload.7z"
     
-    # -v1024m forces 7-Zip to split volumes at 1GB
     cmd = [sz_path, "a", "-v1024m", "-y", str(payload_archive_base), str(file_to_compress)]
     if password: cmd.extend([f"-p{password}", "-mhe=on"])
     
     if not run_command(cmd): logging.error("Failed to compress data payload."); return None
     
-    # Find the generated files (payload.7z.001, etc.)
     archive_files = sorted([f for f in temp_dir.iterdir() if f.name.startswith("payload.7z")])
     
     if not archive_files:
@@ -572,7 +582,7 @@ def generate_info_artifacts(file_manifest: Dict, config: Dict, device: torch.dev
     payload_bytes_per_frame = derived_params['payload_bits_data'] / 8
     total_payload_bytes = sum(f['size'] for f in file_manifest['file_manifest_detailed'])
     actual_data_frames = math.ceil(total_payload_bytes / payload_bytes_per_frame) if payload_bytes_per_frame > 0 else 0
-    info_json_obj["data_frame_count"] = actual_data_frames  # tells decoder how many real data frames exist
+    info_json_obj["data_frame_count"] = actual_data_frames  
 
     total_payload_bits = total_payload_bytes * 8
     hamming_k = derived_params["hamming_k"]
@@ -634,10 +644,13 @@ def generate_info_artifacts(file_manifest: Dict, config: Dict, device: torch.dev
 
     frame_data_block = coded_bits_flat.view(final_frame_count, bits_per_frame)
     logging.info(f"   Storing in manifest: info_frame_count={final_frame_count}, data_frame_count={actual_data_frames}")
-    all_frames = [tensor_to_frame(frame_data_block[i], INFO_K_SIDE, INFO_COLOR_PALETTE_TENSOR, INFO_BITS_PER_PALETTE_COLOR) for i in range(final_frame_count)]
     
-    if not all_frames: return None
-    result_frames = torch.stack(all_frames)
+    result_frames = bit_chunks_to_frame_batch(
+        frame_data_block, INFO_K_SIDE,
+        INFO_COLOR_PALETTE_TENSOR.to(device),
+        INFO_BITS_PER_PALETTE_COLOR
+    )
+    if result_frames is None or result_frames.numel() == 0: return None
     logging.info(f"Generated {final_frame_count} info frames. Result tensor shape: {result_frames.shape}")
     
     return result_frames
@@ -645,30 +658,26 @@ def generate_info_artifacts(file_manifest: Dict, config: Dict, device: torch.dev
 def encode_data_frames_gpu(bits_tensor_gpu: torch.Tensor, derived_params: Dict) -> torch.Tensor:
     device = bits_tensor_gpu.device
     k_side = derived_params['DATA_K_SIDE']
-    palette = derived_params['data_palette']
     bits_per_color = derived_params['bits_per_pixel_data']
-    g_matrix = derived_params['g_matrix'].to(device).float()
+    palette   = derived_params['data_palette']
+    
+    g_matrix_f = derived_params['g_matrix_f']
+    if g_matrix_f.device != device: g_matrix_f = g_matrix_f.to(device)
+    if palette.device  != device: palette  = palette.to(device)
+
     hamming_k = derived_params['hamming_k']
     bits_flat = bits_tensor_gpu.view(-1).to(device).to(torch.uint8)
-    actual_payload_bits = bits_flat.numel()  # Track actual payload before padding
     rem = bits_flat.numel() % hamming_k
     if rem != 0:
         pad_n = hamming_k - rem
         bits_flat = torch.cat((bits_flat, torch.zeros(pad_n, dtype=torch.uint8, device=device)))
     data_chunks = bits_flat.view(-1, hamming_k)
-    if g_matrix.shape[0] != hamming_k:
-        if g_matrix.shape[1] == hamming_k:
-            g_matrix = g_matrix.t()
-        else:
-            raise ValueError(f"G matrix shape {tuple(g_matrix.shape)} incompatible with hamming_k={hamming_k}.")
     
-    # OPTIMIZATION: Use Half Precision for Encoding Matrix Mul
     if device.type == 'cuda':
         data_chunks_f = data_chunks.half()
-        g_matrix_f = g_matrix.half()
         coded_chunks = (torch.matmul(data_chunks_f, g_matrix_f) % 2).to(torch.uint8)
     else:
-        coded_chunks = (torch.matmul(data_chunks.float(), g_matrix.float()) % 2).to(torch.uint8)
+        coded_chunks = (torch.matmul(data_chunks.float(), g_matrix_f) % 2).to(torch.uint8)
 
     coded_bits_flat = coded_chunks.view(-1)
     payload_chunks_per_frame = derived_params['payload_chunks_per_frame']
@@ -694,18 +703,28 @@ def get_derived_encoding_params(config: Dict, device: torch.device) -> Dict:
     params['bits_per_pixel_data'] = int(math.log2(config['NUM_COLORS_DATA']))
     raw_bits_in_data_block = (config['DATA_K_SIDE'] ** 2) * params['bits_per_pixel_data']
     
-    # Use Hamming params from config (defaults to 127/120, or loaded from manifest)
     params['hamming_n'] = int(config.get('DATA_HAMMING_N', 127))
     params['hamming_k'] = int(config.get('DATA_HAMMING_K', 120))
     
-    # Generate Matrices Dynamically
     g_matrix, h_matrix = generate_systematic_hamming_matrices(
         params['hamming_n'], 
         params['hamming_k'], 
         device
     )
+    
+    if g_matrix.shape[0] != params['hamming_k']:
+        if g_matrix.shape[1] == params['hamming_k']:
+            g_matrix = g_matrix.t()
+            
     params['g_matrix'] = g_matrix
     params['h_matrix'] = h_matrix
+    
+    if device.type == 'cuda':
+        params['g_matrix_f'] = g_matrix.half()
+        params['h_matrix_t_f'] = h_matrix.t().half()
+    else:
+        params['g_matrix_f'] = g_matrix.float()
+        params['h_matrix_t_f'] = h_matrix.t().float()
     
     num_potential_groups = raw_bits_in_data_block // params['hamming_n']
     groups_for_byte_align = 8 // math.gcd(8, params['hamming_k'])
@@ -736,10 +755,9 @@ class DataProducerThread(threading.Thread):
         self.bits_per_batch = derived_params['bits_per_gpu_batch']
         self.num_workers = derived_params.get('CPU_WORKER_THREADS', 2)
         self.stop_event = threading.Event()
-        self.raw_queue = queue.Queue(maxsize=4) # Buffer for read-ahead
+        self.raw_queue = queue.Queue(maxsize=4) 
 
     def file_reader(self):
-        """Thread that just reads bytes from disk to keep IO busy."""
         for file_path in self.files_to_encode:
             if self.stop_event.is_set(): break
             logging.info(f"Reading file: {file_path.name}")
@@ -751,62 +769,46 @@ class DataProducerThread(threading.Thread):
                         self.raw_queue.put(chunk)
             except Exception as e:
                 logging.error(f"File read error: {e}")
-        self.raw_queue.put(None) # Signal workers to stop
+        self.raw_queue.put(None) 
 
     def bit_packer_worker(self):
-        """Worker thread that unpacks bits (CPU intensive)."""
-        bit_buffer = np.array([], dtype=np.uint8)
-        
+        max_buf = self.bits_per_batch + self.chunk_size_bytes * 8
+        ring   = np.empty(max_buf, dtype=np.uint8)
+        buf_len = 0   
+
         while not self.stop_event.is_set():
-            # If we have enough in buffer, push to main queue
-            while len(bit_buffer) >= self.bits_per_batch:
-                if self.stop_event.is_set(): return
-                batch_data = bit_buffer[:self.bits_per_batch]
-                self.data_queue.put(torch.from_numpy(batch_data).to(torch.uint8))
-                bit_buffer = bit_buffer[self.bits_per_batch:]
-            
-            # Fetch more data
+            while buf_len >= self.bits_per_batch:
+                if self.stop_event.is_set():
+                    return
+                batch = ring[:self.bits_per_batch].copy()
+                self.data_queue.put(torch.from_numpy(batch))
+                remainder = buf_len - self.bits_per_batch
+                if remainder > 0:
+                    ring[:remainder] = ring[self.bits_per_batch:buf_len]
+                buf_len = remainder
+
             try:
                 raw_chunk = self.raw_queue.get(timeout=1)
             except queue.Empty:
                 continue
 
             if raw_chunk is None:
-                # End of data stream. Push remaining bits.
-                if len(bit_buffer) > 0:
-                    padding = self.bits_per_batch - len(bit_buffer)
-                    padded_data = np.pad(bit_buffer, (0, padding), 'constant')
-                    self.data_queue.put(torch.from_numpy(padded_data).to(torch.uint8))
-                
-                # Signal completion to main thread
-                self.data_queue.put(None) 
+                if buf_len > 0:
+                    padding = self.bits_per_batch - buf_len
+                    ring[buf_len:buf_len + padding] = 0
+                    batch = ring[:self.bits_per_batch].copy()
+                    self.data_queue.put(torch.from_numpy(batch))
+                self.data_queue.put(None)
                 return
 
-            # OPTIMIZATION: Process large chunks in smaller blocks to avoid massive memory duplication
-            # Instead of np.concatenate(huge_buffer, huge_new_bits), we slice the new bits into batches immediately.
-            
-            new_bits = np.unpackbits(np.frombuffer(raw_chunk, dtype=np.uint8))
-            
-            # Prepend existing buffer
-            if len(bit_buffer) > 0:
-                new_bits = np.concatenate((bit_buffer, new_bits))
-                
-            # Slice and dice
-            total_len = len(new_bits)
-            cursor = 0
-            while cursor + self.bits_per_batch <= total_len:
-                if self.stop_event.is_set(): return
-                batch = new_bits[cursor : cursor + self.bits_per_batch]
-                self.data_queue.put(torch.from_numpy(batch).to(torch.uint8))
-                cursor += self.bits_per_batch
-            
-            # Save remainder
-            bit_buffer = new_bits[cursor:]
+            new_bit_count = len(raw_chunk) * 8
+            unpacked = np.unpackbits(np.frombuffer(raw_chunk, dtype=np.uint8))
+            ring[buf_len:buf_len + new_bit_count] = unpacked
+            buf_len += new_bit_count
 
     def run(self):
         logging.info(f"DataProducerThread started with {self.num_workers} workers.")
         
-        # Start File Reader
         reader_thread = threading.Thread(target=self.file_reader, daemon=True)
         reader_thread.start()
 
@@ -822,7 +824,6 @@ class DataProducerThread(threading.Thread):
         self.stop_event.set()
 
 class FrameProducerThread(threading.Thread):
-    """Fetches frames from FFmpeg in a background thread."""
     def __init__(self, video_path: Path, start_frame: int, total_frames: int, batch_size: int, config: Dict, queue: queue.Queue):
         super().__init__(daemon=True)
         self.video_path = video_path
@@ -838,7 +839,6 @@ class FrameProducerThread(threading.Thread):
         while self.total_frames > 0 and not self.stop_event.is_set():
             count = min(self.batch_size, self.total_frames)
             
-            # This is the blocking call we moved out of the main loop
             tensor = extract_frames_batch(
                 self.video_path, 
                 self.current_frame, 
@@ -877,28 +877,36 @@ class FFmpegConsumerThread(threading.Thread):
         height = self.config["VIDEO_HEIGHT"]
         crf = self.config["X264_CRF"]
         fps = self.config["VIDEO_FPS"]
-        keyint = self.config.get("KEYINT_MAX", 1)
-        GPU_CRF = self.config.get("GPU_CRF", 33)
+        keyint = self.config.get("KEYINT_MAX", 600)
+        GPU_CRF = self.config.get("GPU_CRF", 38)
         
-        # GPU Encoding Switch
         if self.config.get("ENABLE_NVENC", False):
-            # GPU Settings (hevc_nvenc / H.265)
+            # GPU Settings (HEVC / H.265) optimized for random B&W noise
             logging.info(f"Using GPU Encoding (hevc_nvenc) with CQ={GPU_CRF}")
             codec_args = [
-                '-c:v', 'h264_nvenc',
-                '-preset', 'medium',      
-                '-cq', str(GPU_CRF),      # Constant Quality
-                '-spatial-aq', '1',   # Help retain spatial details (edges)
-                '-temporal-aq', '1',
+                '-c:v', 'hevc_nvenc',
+                '-preset', 'p6',      # Slower encode, much better compression
+                '-tune', 'hq',
+                '-cq', str(GPU_CRF),
+                '-rc', 'vbr',
+                '-b:v', '0',
+                '-bf', '0',           # CRITICAL: No B-Frames for random noise
+                '-refs', '1',         # CRITICAL: Limit reference frames
+                '-spatial-aq', '0',   # CRITICAL: Disable AQ, stops wasting bits on noise
+                '-temporal-aq', '0',
+                '-tag:v', 'hvc1'
             ]
         else:
             # CPU Settings (libx264)
             logging.info(f"Using CPU Encoding (libx264) with CRF={crf}")
             codec_args = [
                 '-c:v', 'libx264',
-                '-preset', 'medium',
+                '-preset', 'fast',
                 '-tune', 'stillimage', 
+                '-threads', '0',                
                 '-crf', str(crf),
+                '-bf', '0',
+                '-refs', '1'
             ]
 
         self.ffmpeg_command_base = [
@@ -908,7 +916,6 @@ class FFmpegConsumerThread(threading.Thread):
             '-g', str(keyint), 
             '-keyint_min', str(keyint),
             '-sc_threshold', '0',
-            '-vf', f'scale={width}:{height}', 
             '-pix_fmt', 'yuv420p',
             '-movflags', '+frag_keyframe+empty_moov'
         ]
@@ -946,48 +953,56 @@ class FFmpegConsumerThread(threading.Thread):
     def _finalize_current_segment(self):
         if self.ffmpeg_process:
             logging.info("Finalizing video segment... (Flushing buffers & writing MP4 header)")
-            
-            # 1. Close stdin explicitly to send EOF to FFmpeg
             if self.ffmpeg_process.stdin:
                 try:
                     self.ffmpeg_process.stdin.flush()
                     self.ffmpeg_process.stdin.close()
                 except (BrokenPipeError, OSError):
-                    # If pipe is already broken, FFmpeg might have crashed or closed it.
                     pass
-            
-            # 2. Wait for process to exit normally
             try:
-                # We wait indefinitely here because +faststart on large files takes time.
                 self.ffmpeg_process.wait()
             except subprocess.TimeoutExpired:
                 logging.warning("FFmpeg did not exit gracefully, terminating...")
                 self.ffmpeg_process.terminate()
-            
-            # 3. Check return code (errors are now printed to console via sys.stderr)
             if self.ffmpeg_process.returncode != 0:
                 logging.error(f"FFmpeg process exited with error code {self.ffmpeg_process.returncode}")
 
         self.ffmpeg_process = None
         self.frames_written_in_segment = 0
 
-    def _write_frame(self, frame_np: np.ndarray):
+    def _write_batch(self, np_batch: np.ndarray):
         if self.ffmpeg_process is None:
             self._start_new_segment()
         if self.ffmpeg_process is None or self.ffmpeg_process.stdin is None:
             return
+
+        num_frames = len(np_batch)
+        offset = 0
         try:
-            self.ffmpeg_process.stdin.write(frame_np.tobytes())
-            self.frames_written_in_segment += 1
-            if self.max_frames_per_segment and self.frames_written_in_segment >= self.max_frames_per_segment:
-                logging.info("Segment reached maximum duration; rotating to a new MP4 file.")
-                self._finalize_current_segment()
+            while offset < num_frames:
+                if self.stop_event.is_set():
+                    break
+                if self.max_frames_per_segment:
+                    remaining_in_seg = self.max_frames_per_segment - self.frames_written_in_segment
+                    chunk_end = min(offset + remaining_in_seg, num_frames)
+                else:
+                    chunk_end = num_frames
+
+                chunk = np_batch[offset:chunk_end]
+                self.ffmpeg_process.stdin.write(chunk.tobytes())
+                written = chunk_end - offset
+                self.frames_written_in_segment += written
+                offset = chunk_end
+
+                if self.max_frames_per_segment and self.frames_written_in_segment >= self.max_frames_per_segment:
+                    logging.info("Segment reached maximum duration; rotating to a new MP4 file.")
+                    self._finalize_current_segment()
+                    if offset < num_frames:
+                        self._start_new_segment()
         except (BrokenPipeError, OSError):
-             logging.error("Failed to write to FFmpeg stdin (Broken Pipe). Process may have died.")
-             # Trigger finalize to read the error code and safely close
-             self._finalize_current_segment()
-             # Raise to stop the loop
-             raise
+            logging.error("Failed to write to FFmpeg stdin (Broken Pipe). Process may have died.")
+            self._finalize_current_segment()
+            raise
 
     def run(self):
         logging.info("FFmpegConsumerThread started.")
@@ -999,17 +1014,17 @@ class FFmpegConsumerThread(threading.Thread):
                 if frame_batch is None:
                     break
                 for sub_batch in torch.split(frame_batch, self.sub_batch_size):
+                    if self.stop_event.is_set():
+                        break
+                    # Ultra-fast zero-float tensor resize utilizing mode='nearest' natively on uint8 CPU tensors
                     if sub_batch.shape[1] != height or sub_batch.shape[2] != width:
                          sub_batch_resized = torch.nn.functional.interpolate(
-                             sub_batch.permute(0, 3, 1, 2).float(), size=(height, width), mode='nearest-exact'
-                         ).permute(0, 2, 3, 1).byte()
+                             sub_batch.permute(0, 3, 1, 2), size=(height, width), mode='nearest'
+                         ).permute(0, 2, 3, 1)
+                         np_batch = sub_batch_resized.contiguous().cpu().numpy()
                     else:
-                        sub_batch_resized = sub_batch
-                    np_batch = sub_batch_resized.contiguous().cpu().numpy()
-                    for frame_np in np_batch:
-                        if self.stop_event.is_set():
-                            break
-                        self._write_frame(frame_np)
+                        np_batch = sub_batch.contiguous().cpu().numpy()
+                    self._write_batch(np_batch)
         except (BrokenPipeError, OSError):
             logging.warning("FFmpeg pipe closed, likely due to an early exit or shutdown.")
         except Exception as e:
@@ -1020,8 +1035,6 @@ class FFmpegConsumerThread(threading.Thread):
 
     def stop(self):
         self.stop_event.set()
-        # Do not force terminate here immediately. Let the run loop finish or finalize handle it.
-        # But if we must:
         if self.ffmpeg_process:
             self._finalize_current_segment()
 
@@ -1059,7 +1072,6 @@ def encode_orchestrator(input_path: Path, output_dir: Path, password: Optional[s
         consumer = FFmpegConsumerThread(frame_queue, output_base_path, config)
         producer.start(); consumer.start()
         
-        # Initialize progress bar
         total_bits_to_encode = sum(f.stat().st_size for f in files_to_encode) * 8
         progress_bar = ConsoleProgressBar(total_bits_to_encode, prefix="Encoding")
         progress_bar.start()
@@ -1074,13 +1086,11 @@ def encode_orchestrator(input_path: Path, output_dir: Path, password: Optional[s
         def safe_queue_put(item):
             while True:
                 try:
-                    # Try to put with a timeout to allow checking consumer health
                     frame_queue.put(item, timeout=0.5)
                     break
                 except queue.Full:
                     if not consumer.is_alive():
                         raise RuntimeError("FFmpeg Consumer died unexpectedly! Check console output for FFmpeg errors.")
-                    # If consumer is alive, loop and try again
 
         def flush_encoded_batches(force: bool = False) -> None:
             while inflight_batches and (force or len(inflight_batches) >= max_inflight):
@@ -1090,21 +1100,19 @@ def encode_orchestrator(input_path: Path, output_dir: Path, password: Optional[s
                 if cpu_tensor is None or cpu_tensor.numel() == 0:
                     continue
                 ready_tensor = cpu_tensor.contiguous()
-                safe_queue_put(ready_tensor) # Use safe put
+                safe_queue_put(ready_tensor) 
 
         try:
             logging.info("--- Starting main processing pipeline ---")
             safe_queue_put(barcode_frame_batch)
             safe_queue_put(info_frames_batch)
             while True:
-                # Also check consumer health while waiting for data
                 try:
                     bits_tensor_cpu = data_queue.get(timeout=5.0)
                 except queue.Empty:
                     if not consumer.is_alive():
                          raise RuntimeError("FFmpeg Consumer died unexpectedly while waiting for data.")
                     if not producer.is_alive() and data_queue.empty():
-                         # Producer finished and queue empty
                          break
                     continue
 
@@ -1144,7 +1152,6 @@ def encode_orchestrator(input_path: Path, output_dir: Path, password: Optional[s
             logging.info("Signaling FFmpeg consumer to finish...")
             while True:
                 try:
-                    # Attempt to put the sentinel. If full, wait 1s then retry.
                     frame_queue.put(None, timeout=1)
                     break
                 except queue.Full:
@@ -1241,11 +1248,10 @@ class DataWriterThread(threading.Thread):
         try:
             file_handles, current_file_idx, bytes_written_to_current_file = {}, 0, 0
             manifest_files = self.manifest['file_manifest_detailed']
-            write_buffer_size = 1024 * 1024 * 4 # 4MB Buffer
+            write_buffer_size = 1024 * 1024 * 4 
             
             while not self.stop_event.is_set():
                 try:
-                    # Non-blocking get with short timeout to check stop_event frequently
                     data_bytes = self.data_queue.get(timeout=0.5)
                     if data_bytes is None: break
                 except queue.Empty:
@@ -1290,13 +1296,13 @@ class DataWriterThread(threading.Thread):
 
 
 def extract_frames_batch(video_path: Path, start_frame_index: int, frame_count: int, config: Dict, frame_type: str = 'data') -> Optional[torch.Tensor]:
-    """Extract a batch using seeking. Only used for Info/Barcode or single-file fallback."""
     if frame_count <= 0: return None
     ffmpeg_path = config["FFMPEG_PATH"]
     fps = config.get("VIDEO_FPS", 60)
     extract_size = config.get("DATA_K_SIDE", 180) if frame_type == 'data' else (INFO_K_SIDE if frame_type == 'info' else 720)
     timestamp = start_frame_index / fps
-    scale_filter = f"scale={extract_size}:{extract_size}:flags=neighbor:force_original_aspect_ratio=decrease,pad={extract_size}:{extract_size}:(ow-iw)/2:(oh-ih)/2"
+    # CRITICAL: flags=area calculates the average of the 4x4 block, healing extreme compression noise seamlessly.
+    scale_filter = f"scale={extract_size}:{extract_size}:flags=area:force_original_aspect_ratio=decrease,pad={extract_size}:{extract_size}:(ow-iw)/2:(oh-ih)/2"
     command = [
         ffmpeg_path, '-hide_banner', '-loglevel', 'error', '-accurate_seek', '-seek_timestamp', '1',
         '-ss', f'{timestamp:.6f}', '-i', str(video_path), '-vframes', str(frame_count),
@@ -1314,10 +1320,6 @@ def extract_frames_batch(video_path: Path, start_frame_index: int, frame_count: 
         return None
 
 class ContinuousPipeFrameReader:
-    """
-    Reads multiple video files sequentially via a continuous FFmpeg pipe using the CONCAT protocol.
-    This ensures perfect synchronization across file boundaries.
-    """
     def __init__(self, video_paths: List[Path], config: Dict, temp_dir: Path, frame_type: str = 'data'):
         self.video_paths = video_paths
         self.config = config
@@ -1337,11 +1339,9 @@ class ContinuousPipeFrameReader:
         self._start_concat_process()
 
     def _start_concat_process(self):
-        # Create the concat list file
         try:
             with open(self.concat_file_path, 'w', encoding='utf-8') as f:
                 for path in self.video_paths:
-                    # FFmpeg concat file requires escaped paths
                     safe_path = str(path.resolve()).replace("'", "'\\''")
                     f.write(f"file '{safe_path}'\n")
         except Exception as e:
@@ -1351,7 +1351,7 @@ class ContinuousPipeFrameReader:
         logging.info(f"Opening continuous read pipe for {len(self.video_paths)} files using concat protocol...")
         
         scale_filter = (
-            f"scale={self.extract_size}:{self.extract_size}:flags=neighbor:force_original_aspect_ratio=decrease,"
+            f"scale={self.extract_size}:{self.extract_size}:flags=area:force_original_aspect_ratio=decrease,"
             f"pad={self.extract_size}:{self.extract_size}:(ow-iw)/2:(oh-ih)/2"
         )
         
@@ -1369,13 +1369,11 @@ class ContinuousPipeFrameReader:
         ]
         
         try:
-            # stderr=subprocess.DEVNULL to prevent deadlocks when buffer fills
             self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**7)
         except Exception as e:
             logging.error(f"Failed to open ffmpeg concat pipe: {e}")
 
     def skip_frames(self, count: int):
-        """Skip N frames from the beginning of the stream."""
         if count <= 0: return
         logging.info(f"Skipping first {count} frames of the stream (metadata)...")
         bytes_to_skip = count * self.frame_bytes
@@ -1394,8 +1392,6 @@ class ContinuousPipeFrameReader:
         
         target_bytes = count * self.frame_bytes
         try:
-            # Try to read exactly the amount needed
-            # Note: stdout.read(n) might return less than n only on EOF
             raw = self.process.stdout.read(target_bytes)
         except Exception as e:
             logging.error(f"Error reading from pipe: {e}")
@@ -1422,47 +1418,39 @@ class ContinuousPipeFrameReader:
 
 def decode_barcode(frame_tensor: torch.Tensor) -> Optional[Tuple[int, int]]:
     h, w, _ = frame_tensor.shape
-    num_bars, bar_width, bits = BARCODE_NUM_BITS, w / float(BARCODE_NUM_BITS), []
-    for i in range(num_bars):
-        center_x = int((i + 0.5) * bar_width)
-        center_x = min(max(center_x, 0), w - 1)
-        avg_brightness = float(frame_tensor[:, center_x, 0].float().mean())
-        bits.append('1' if avg_brightness > 127 else '0')
-    try:
-        combined_value = int("".join(bits), 2)
-    except ValueError:
-        logging.error("Failed to parse barcode bits into integer.")
+    num_bars = BARCODE_NUM_BITS
+    bar_width = w / float(num_bars)
+
+    center_xs = (torch.arange(num_bars, dtype=torch.float32) + 0.5) * bar_width
+    center_xs = center_xs.clamp(0, w - 1).long()               
+    
+    # Int32 Optimization avoiding `.float()` casts. Uses ONLY Green channel (index 1)
+    avg_brightness = frame_tensor[:, center_xs, 1].sum(dim=0, dtype=torch.int32)
+    bit_values = (avg_brightness > (127 * h)).long()               
+    
+    powers = 2 ** torch.arange(num_bars - 1, -1, -1, dtype=torch.long)
+    combined_value = int((bit_values * powers).sum().item())
+
+    num_info_frames = combined_value & 0xFFFF
+    encoder_fps    = (combined_value >> 16) & 0xFF
+    if encoder_fps == 0:
+        logging.error("Decoded FPS from barcode is 0, which is invalid.")
         return None
-    num_info_frames, encoder_fps = combined_value & 0xFFFF, (combined_value >> 16) & 0xFF
-    if encoder_fps == 0: logging.error("Decoded FPS from barcode is 0, which is invalid."); return None
     logging.info(f"Decoded barcode: {num_info_frames} info frames, {encoder_fps} FPS.")
     return num_info_frames, encoder_fps
 
 def bits_to_bytes(bits: torch.Tensor) -> bytes:
-    """Pack a 1-D uint8 bit tensor (MSB-first per byte) into bytes.
-    Matches the order used by np.unpackbits (big-endian within each byte).
-    """
     bits_np = bits.cpu().numpy().astype(np.uint8)
     rem = bits_np.size % 8
     if rem != 0:
         bits_np = np.concatenate((bits_np, np.zeros(8 - rem, dtype=np.uint8)))
-    packed = np.packbits(bits_np)
-    return bytes(packed.tolist())
+    return np.packbits(bits_np).tobytes()
 
 def decode_info_frames(frames, device: torch.device, syndrome_table: Optional[torch.Tensor] = None) -> Optional[Dict]:
-    """Decode info frames (Hamming(7,4) encoded JSON) back into a Python dict.
-
-    Accepts either a torch.Tensor of shape (num_frames, H, W, 3) or a list of such tensors.
-    Automatically downscales frames to INFO_K_SIDE x INFO_K_SIDE before bit extraction.
-    If a syndrome_table is provided it will be used; otherwise it is constructed from the
-    built-in INFO_H_MATRIX_TENSOR.
-    Returns the decoded JSON object or None on failure.
-    """
     if frames is None:
         logging.error("No frames provided to decode_info_frames.")
         return None
 
-    # Normalize to a single tensor on the target device
     if isinstance(frames, list):
         if len(frames) == 0:
             logging.error("Empty frame list passed to decode_info_frames.")
@@ -1470,7 +1458,6 @@ def decode_info_frames(frames, device: torch.device, syndrome_table: Optional[to
         try:
             frames = torch.stack([f.to(device) if isinstance(f, torch.Tensor) else torch.from_numpy(np.array(f)).to(device) for f in frames])
         except Exception:
-            # Fallback: try to coerce each element
             frames = torch.stack([torch.from_numpy(np.array(f)).to(device) if not isinstance(f, torch.Tensor) else f.to(device) for f in frames])
     else:
         frames = frames.to(device)
@@ -1478,19 +1465,16 @@ def decode_info_frames(frames, device: torch.device, syndrome_table: Optional[to
     if frames.dim() == 3:
         frames = frames.unsqueeze(0)
 
-    # Downscale frames to INFO_K_SIDE x INFO_K_SIDE to match encoding resolution
     num_frames, h, w, c = frames.shape
     if h != INFO_K_SIDE or w != INFO_K_SIDE:
         frames = torch.nn.functional.interpolate(
-            frames.permute(0, 3, 1, 2).float(), 
+            frames.permute(0, 3, 1, 2), 
             size=(INFO_K_SIDE, INFO_K_SIDE), 
-            mode='nearest-exact'
-        ).permute(0, 2, 3, 1).byte()
+            mode='nearest'
+        ).permute(0, 2, 3, 1).contiguous()
 
-    # Convert frames back to bit stream using the same palette/packing used for encoding
     bits = frame_to_bits_batch(frames, INFO_COLOR_PALETTE_TENSOR.to(device), INFO_BITS_PER_PALETTE_COLOR)
 
-    # Use provided syndrome table or build one
     if syndrome_table is None:
         h_matrix = INFO_H_MATRIX_TENSOR.to(device)
         syndrome_table = build_syndrome_lookup_table(h_matrix)
@@ -1500,18 +1484,14 @@ def decode_info_frames(frames, device: torch.device, syndrome_table: Optional[to
     n = INFO_HAMMING_N
     k = INFO_HAMMING_K
 
-    # Pad to full codewords if necessary
     rem = bits.numel() % n
     if rem != 0:
         pad_n = n - rem
         bits = torch.cat((bits, torch.zeros(pad_n, dtype=torch.uint8, device=device)))
 
-    # Decode using existing Hamming decoder
-    # hamming_decode_gpu expects a flat bit tensor and will reshape internally to codewords
     decoded_bits, num_errors = hamming_decode_gpu(bits, h_matrix, k, syndrome_table)
     logging.info(f"Info frames decoded with {num_errors} corrected Hamming codewords.")
 
-    # Convert decoded bits back to bytes and extract JSON
     try:
         payload_bytes = bits_to_bytes(decoded_bits)
     except Exception as e:
@@ -1543,40 +1523,40 @@ def decode_data_frames_gpu(
     return_error_tensor: bool = False
 ) -> Tuple[torch.Tensor, Union[int, torch.Tensor]]:
     device = frame_batch.device
-    palette = derived_params['data_palette'].to(device)
+    palette = derived_params['data_palette']
+    h_matrix = derived_params['h_matrix']
+    if palette.device  != device: palette  = palette.to(device)
+    if h_matrix.device != device: h_matrix = h_matrix.to(device)
+    
+    h_matrix_t_f = derived_params['h_matrix_t_f']
+    if h_matrix_t_f.device != device: h_matrix_t_f = h_matrix_t_f.to(device)
+
     bits_per_color = derived_params['bits_per_pixel_data']
-    h_matrix = derived_params['h_matrix'].to(device)
     hamming_k = derived_params['hamming_k']
     syndrome_table = derived_params['syndrome_table']
     total_encoded_bits_per_frame = derived_params['total_encoded_bits_to_store_data']
     k_side = derived_params['DATA_K_SIDE']
     
-    # Frames are already extracted at DATA_K_SIDE x DATA_K_SIDE resolution (no downscaling needed)
     if frame_batch.shape[1:3] != (k_side, k_side):
         logging.warning(f"Frame batch size {frame_batch.shape[1:3]} != expected {k_side}x{k_side}, resizing...")
         frame_batch = torch.nn.functional.interpolate(
-            frame_batch.permute(0, 3, 1, 2).float(), size=(k_side, k_side), mode='nearest'
-        ).permute(0, 2, 3, 1).byte()
+            frame_batch.permute(0, 3, 1, 2), size=(k_side, k_side), mode='nearest'
+        ).permute(0, 2, 3, 1).contiguous()
     
-    # Extract bits using the same palette as encoding
-    # This extracts ALL bits from the frame (k_side^2 * bits_per_color), including padding
     coded_bits = frame_to_bits_batch(frame_batch, palette, bits_per_color)
     
     num_frames = frame_batch.shape[0]
-    expected_bits = num_frames * total_encoded_bits_per_frame if total_encoded_bits is None else total_encoded_bits
-    actual_bits = coded_bits.numel()
-    bits_per_frame_extracted = actual_bits // num_frames if num_frames > 0 else 0
+    bits_per_frame_extracted = coded_bits.numel() // num_frames if num_frames > 0 else 0
     
-    # Remove padding from each frame individually, but respect actual total
-    if total_encoded_bits is not None and total_encoded_bits < expected_bits:
+    if total_encoded_bits is not None and total_encoded_bits < coded_bits.numel():
         valid_bits = coded_bits[:total_encoded_bits]
     else:
-        valid_bits_list = []
-        for i in range(num_frames):
-            start_idx = i * bits_per_frame_extracted
-            end_idx = start_idx + total_encoded_bits_per_frame
-            valid_bits_list.append(coded_bits[start_idx:end_idx])
-        valid_bits = torch.cat(valid_bits_list)
+        valid_bits = (
+            coded_bits
+            .view(num_frames, bits_per_frame_extracted)[:, :total_encoded_bits_per_frame]
+            .contiguous()
+            .view(-1)
+        )
     
     if total_encoded_bits is not None and valid_bits.numel() > total_encoded_bits:
         valid_bits = valid_bits[:total_encoded_bits]
@@ -1586,7 +1566,8 @@ def decode_data_frames_gpu(
         h_matrix,
         hamming_k,
         syndrome_table,
-        return_error_tensor=return_error_tensor
+        return_error_tensor=return_error_tensor,
+        h_t=h_matrix_t_f
     )
 
 def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optional[str], config: Dict, device: torch.device):
@@ -1599,7 +1580,6 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
     progress_bar = None
 
     try:
-        # Folder Input Logic
         input_candidate = Path(input_path_str.strip())
         video_paths = []
         
@@ -1611,7 +1591,6 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
                 logging.error("No video files found in the provided directory.")
                 return
         else:
-            # Comma-separated list logic
             raw_inputs = [segment.strip() for segment in input_path_str.split(',') if segment.strip()]
             if not raw_inputs:
                 logging.error("No input video paths provided.")
@@ -1623,7 +1602,6 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
                     return
                 video_paths.append(p)
 
-        # Log video order
         logging.info(f"Decoding video sequence:")
         for idx, p in enumerate(video_paths):
             logging.info(f"  {idx+1}: {p.name}")
@@ -1631,7 +1609,6 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         primary_video = video_paths[0]
         multi_segment = len(video_paths) > 1
 
-        # Extract barcode frame at full 720x720 from primary video
         barcode_frame_batch = extract_frames_batch(primary_video, 0, 1, config, frame_type='barcode')
         if barcode_frame_batch is None or barcode_frame_batch.shape[0] == 0:
             logging.error("Failed to extract barcode frame.")
@@ -1642,17 +1619,14 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
             return
         num_info_frames, _ = barcode_data
         
-        # Extract info frames at 16x16 (INFO_K_SIDE)
-        # Use a single batched ffmpeg call to avoid per-frame seeking inconsistencies
         if num_info_frames <= 0:
             logging.error("No info frames indicated in barcode; aborting.")
             return
-        # Read from start of file to avoid tiny seeks (frag files sometimes have imprecise seek behavior)
+
         batch = extract_frames_batch(primary_video, 0, num_info_frames + 1, config, frame_type='info')
         if batch is None or batch.shape[0] < (num_info_frames + 1):
             logging.error(f"Failed to extract info frames batch (expected {num_info_frames+1}, got {0 if batch is None else batch.shape[0]}). Aborting.")
             return
-        # First frame is barcode (frame 0); info frames follow
         info_frames = batch[1:1+num_info_frames]
         
         info_syndrome_table = build_syndrome_lookup_table(INFO_H_MATRIX_TENSOR.to(device))
@@ -1664,9 +1638,6 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         
         apply_snapshot_to_config(config, session_params.get("encode_config_snapshot"))
         
-        # --- LEGACY COMPATIBILITY CHECK ---
-        # If the loaded manifest doesn't specify Hamming params (old version), 
-        # force the config to use the legacy Hamming(7,4) settings for this session.
         if "DATA_HAMMING_N" not in session_params.get("encode_config_snapshot", {}):
             logging.warning("Legacy video detected (missing Hamming params in manifest). Enforcing Hamming(7,4).")
             config["DATA_HAMMING_N"] = 7
@@ -1682,7 +1653,6 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
 
         total_encoded_bits_budget = session_params.get("total_encoded_data_bits")
         
-        # Calculate how many frames to skip at start of video 1 (Barcode + Info)
         skip_frame_count = 1 + num_info_frames
         
         if 'data_frame_count' in session_params:
@@ -1694,7 +1664,6 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
         
         logging.info(f"Data extraction will process {num_data_frames} data frames.")
 
-        # Initialize Progress Bar
         progress_bar = ConsoleProgressBar(num_data_frames, prefix="Decoding")
         progress_bar.start()
 
@@ -1724,10 +1693,8 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
                 data_queue.put(np.packbits(ready_bits.cpu().numpy()).tobytes())
 
         try:
-            # Use ContinuousPipeFrameReader with CONCAT for Data extraction
             reader = ContinuousPipeFrameReader(video_paths, config, temp_dir, frame_type='data')
             
-            # Skip the barcode and info frames on the first video
             if skip_frame_count > 0:
                 reader.skip_frames(skip_frame_count)
 
@@ -1739,16 +1706,13 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
                 batch_tensor_cpu = reader.fetch_frames(batch_size)
                 
                 if batch_tensor_cpu is None:
-                    # Reader exhausted
                     break
 
-                # Handle final batch padding if necessary (only if this is truly the end of data)
                 if batch_tensor_cpu.shape[0] < batch_size:
                      deficit = batch_size - batch_tensor_cpu.shape[0]
                      padding = torch.zeros((deficit, config['DATA_K_SIDE'], config['DATA_K_SIDE'], PIXEL_CHANNELS), dtype=torch.uint8)
                      batch_tensor_cpu = torch.cat((batch_tensor_cpu, padding), dim=0)
 
-                # Process Batch
                 progress_bar.update(batch_tensor_cpu.shape[0])
 
                 if use_cuda:
@@ -1757,7 +1721,6 @@ def decode_orchestrator(input_path_str: str, output_dir: Path, password: Optiona
                     next_decode_stream = (next_decode_stream + 1) % len(decode_streams)
                     with torch.cuda.stream(stream):
                         batch_gpu = pinned_batch.to(device, non_blocking=True)
-                        # We pass None for total_encoded_bits to skip clamping
                         decoded_bits, num_corrections = decode_data_frames_gpu(batch_gpu, derived_params, None, return_error_tensor=True)
                         decoded_bits_cpu = decoded_bits.to("cpu", non_blocking=True)
                     inflight_decodes.append((stream, decoded_bits_cpu, num_corrections))
@@ -1885,7 +1848,6 @@ def main():
     
     args = parser.parse_args()
 
-    # If not testing, mode and input are required
     if not args.mode or not args.input:
         parser.error("the following arguments are required: -mode, -input")
 
@@ -1901,10 +1863,7 @@ def main():
 
         input_path_str = args.input
         
-        # Handle comma-separated inputs for default output directory calculation
         if "," in input_path_str:
-            # Take the first file path to determine the default output directory
-            # We strip whitespace to handle "file1, file2"
             first_input_str = input_path_str.split(",")[0].strip()
             reference_path = Path(first_input_str).resolve()
         else:
@@ -1913,7 +1872,6 @@ def main():
         if args.output: 
             output_dir = Path(args.output).resolve()
         else: 
-            # Create output dir based on the reference path (first input file)
             output_dir = reference_path.parent / f"{reference_path.stem}_F2YT_Output"
         
         output_dir.mkdir(exist_ok=True)
